@@ -1,0 +1,16 @@
+.venv/
+.venv-cosyvoice/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+runs/
+.vendor/

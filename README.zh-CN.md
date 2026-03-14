@@ -1,0 +1,256 @@
+# VideoCut
+
+[English](README.md)
+
+VideoCut 是一条本地视频处理流水线，用来把英文 YouTube 视频处理成带中文字幕和中文配音的新视频。
+
+它面向实际可落地的端到端流程：
+
+1. 用 `yt-dlp` 下载单个 YouTube 视频和字幕
+2. 优先复用英文字幕，没有则回退到 ASR
+3. 把字幕翻译成更适合配音的简体中文
+4. 用 `edge-tts` 或 `CosyVoice` 为每条字幕生成中文配音
+5. 按“自然语速优先”的规则重新排程整条中文配音
+6. 混音并导出带字幕的最终视频
+
+## 能做什么
+
+- 一次处理一个 YouTube 视频
+- 优先使用现成英文字幕，减少转录误差和成本
+- 没有英文字幕时，回退到 `faster-whisper` 做英文转录
+- 没有翻译 API key 时，直接复用 YouTube 已有中文字幕继续完成流程
+- 通过 OpenAI 兼容接口完成字幕翻译
+- 支持两种中文配音后端：
+  - `edge-tts`：接入简单，适合快速跑通
+  - `CosyVoice`：适合本地跨语种 voice cloning
+- 导出：
+  - 中文 `SRT` 字幕
+  - 混合后的中文配音轨
+  - 带烧录字幕或软字幕的最终 `MP4`
+- 保存 `manifest.json`，后续可以在不重新下载视频的前提下重新配音和导出
+
+## 工作原理
+
+### 1. 下载素材
+
+`yt-dlp` 会下载视频本体以及英文字幕或自动字幕。如果没有配置翻译接口，VideoCut 还会额外尝试拉取中文字幕轨，这样在没有 LLM 的情况下也能继续生成中文配音视频。
+
+### 2. 字幕清洗与切分
+
+VideoCut 会解析 VTT，清理 HTML 标签和内联时间戳，合并渐进式重复字幕，必要时把过短的相邻片段拼接起来，得到更稳定的字幕段列表。
+
+### 3. 翻译
+
+如果配置了 `VIDEOCUT_LLM_API_KEY`，系统会按批次把字幕发到 OpenAI 兼容的 `/chat/completions` 接口，请求返回严格 JSON。若某批失败，会自动拆成更小批次重试。
+
+如果没有 API key，但视频本身带有中文字幕轨，则直接复用中文字幕，不再调用翻译接口。
+
+### 4. 中文配音
+
+每条字幕会单独生成一个音频片段。
+
+- `edge-tts`：适合快速验证流程，部署成本低
+- `CosyVoice`：适合做参考音色驱动的中文配音
+  - `cross_lingual`：只需要参考音频
+  - `zero_shot`：需要参考音频和参考文本
+
+如果没有显式提供参考音频，VideoCut 会自动从原视频前段抽一小段人声作为 `CosyVoice` 的提示音频。
+
+### 5. 自然排程
+
+VideoCut 不会把中文配音死板地压回原始英文字幕框，而是采用“自然语速优先”的排程策略：
+
+- 限制开头静音时间
+- 允许一小段全局前移，减少“前面空一大截”的问题
+- 先计算整条中文最少需要的基础播放倍率
+- 为相邻句子保留最小间隔，避免句子挤在一起
+- 允许每句相对下一个锚点有小幅滞后
+- 只有在必要时才加速单句，并且不会超过 `VIDEOCUT_MAX_PLAYBACK_RATE`
+
+如果即使在当前速度上限下仍塞不进整条视频，流水线会直接报错，而不是生成明显失真的结果。
+
+### 6. 混音与导出
+
+所有配音片段会先按照排程时间轴做延迟和变速，再通过 `ffmpeg` 混成一条中文配音轨，最后与原视频合成：
+
+- 如果本地 `ffmpeg` 支持 `subtitles` filter，就直接烧录中文字幕
+- 如果不支持，就回退为软字幕封装到最终 MP4 中
+
+## 环境要求
+
+- Python 3.11+
+- `ffmpeg`
+- `ffprobe`
+- `yt-dlp`
+
+可选依赖：
+
+- `faster-whisper`，用于无英文字幕时的 ASR 回退
+- `CosyVoice` 和模型权重，用于本地 voice cloning
+
+## 安装
+
+### 基础安装
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+```
+
+### 启用 ASR 回退
+
+```bash
+uv pip install -e ".[asr]"
+```
+
+### 可选：配置 CosyVoice
+
+本仓库不会把 `CosyVoice` 源码和模型权重一起纳入 Git。建议把它们保留在本地目录，或者放在 `.vendor/CosyVoice` 这种被忽略的目录下。
+
+示例：
+
+```bash
+git clone https://github.com/FunAudioLLM/CosyVoice.git .vendor/CosyVoice
+```
+
+然后把 `VIDEOCUT_COSYVOICE_MODEL_DIR` 指向你已经下载好的模型目录。
+
+## 配置
+
+先复制环境变量模板：
+
+```bash
+cp .env.example .env
+```
+
+### 翻译接口
+
+```env
+VIDEOCUT_LLM_BASE_URL=https://api.openai.com/v1
+VIDEOCUT_LLM_API_KEY=your_api_key
+VIDEOCUT_LLM_MODEL=gpt-4o-mini
+```
+
+如果源视频本身已经带有 `zh-Hans`、`zh-CN` 或 `zh-Hant` 字幕，即使不配置 API key，也可以直接复用中文字幕跑完整条流程。
+
+### 最快的 TTS 路径：edge-tts
+
+```env
+VIDEOCUT_TTS_PROVIDER=edge
+VIDEOCUT_TTS_VOICE=zh-CN-YunxiNeural
+VIDEOCUT_TTS_RATE=+5%
+VIDEOCUT_ORIGINAL_AUDIO_VOLUME=0.0
+VIDEOCUT_DUB_AUDIO_VOLUME=1.0
+```
+
+### 更高拟人度的本地方案：CosyVoice
+
+```env
+VIDEOCUT_TTS_PROVIDER=cosyvoice
+VIDEOCUT_COSYVOICE_PYTHON=python3.11
+VIDEOCUT_COSYVOICE_REPO_DIR=/absolute/path/to/CosyVoice
+VIDEOCUT_COSYVOICE_MODEL_DIR=/absolute/path/to/Fun-CosyVoice3-0.5B
+VIDEOCUT_COSYVOICE_MODE=cross_lingual
+```
+
+可选参考音频：
+
+```env
+VIDEOCUT_REFERENCE_AUDIO_PATH=/absolute/path/to/reference.wav
+VIDEOCUT_REFERENCE_TEXT=
+```
+
+### 排程参数
+
+下面这组参数的目标是让中文更自然，而不是机械贴回英文字幕窗口：
+
+```env
+VIDEOCUT_MAX_PLAYBACK_RATE=1.18
+VIDEOCUT_MAX_SEGMENT_LAG=0.8
+VIDEOCUT_MAX_OPENING_SILENCE=0.35
+VIDEOCUT_MAX_GLOBAL_SHIFT=1.5
+VIDEOCUT_MIN_SEGMENT_GAP=0.05
+```
+
+## 使用方式
+
+### 跑完整条流水线
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+### 指定工作目录和声音
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --workdir runs/demo \
+  --voice zh-CN-YunxiNeural \
+  --dub-volume 1.0
+```
+
+### 切到 CosyVoice
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --tts-provider cosyvoice \
+  --cosyvoice-repo /absolute/path/to/CosyVoice \
+  --cosyvoice-model /absolute/path/to/Fun-CosyVoice3-0.5B
+```
+
+### 不烧录字幕，只保留字幕文件
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" --no-burn-subtitles
+```
+
+## 输出结构
+
+每次运行都会在 `runs/` 或你指定的 `--workdir` 下生成一个工作目录。
+
+- `source/`：下载的视频、字幕和抽取的音频
+- `subtitles/zh.srt`：生成的中文字幕
+- `tts/`：逐句配音片段
+- `tts/reference_prompt.wav`：自动抽取的 `CosyVoice` 参考音频
+- `tts/cosyvoice_inputs.json`：`CosyVoice` 批量推理输入清单
+- `audio/dubbed_track.m4a`：混合后的中文配音轨
+- `final_cn.mp4`：最终导出视频
+- `manifest.json`：完整任务清单，可用于复查或二次渲染
+
+## 辅助脚本
+
+### 基于 manifest 重新渲染
+
+如果你已经拿到了翻译后的片段，只想换 TTS、换音色或换排程参数，可以直接重渲染：
+
+```bash
+python scripts/render_from_manifest.py \
+  --manifest /absolute/path/to/manifest.json \
+  --output-dir /absolute/path/to/rerender \
+  --tts-provider edge \
+  --voice zh-CN-YunxiNeural
+```
+
+### 重写过长字幕
+
+这个脚本会扫描 `manifest.json` 里播放倍率过高的句子，调用本地 `ollama` 模型把中文改写得更短，再输出一个新的 manifest：
+
+```bash
+python scripts/rewrite_dub_manifest.py \
+  --manifest /absolute/path/to/manifest.json \
+  --threshold 1.12 \
+  --target-rate 1.05
+```
+
+## 当前限制
+
+- 目前只处理单视频，不处理播放列表
+- 不做逐帧口型同步
+- 字幕质量受原字幕或 ASR 质量影响
+- 翻译质量、术语一致性取决于你配置的模型
+- `CosyVoice` 在 macOS 上通常比 `edge-tts` 慢很多，长视频需要预留时间
+
+## 合规提醒
+
+在下载、翻译、配音、再发布任何源视频之前，请先确认你对源内容拥有合法使用权限，并遵守 YouTube 平台规则以及相关版权要求。

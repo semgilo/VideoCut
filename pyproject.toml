@@ -1,0 +1,23 @@
+[project]
+name = "videocut"
+version = "0.1.0"
+description = "YouTube to Chinese subtitle and dubbing automation pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "edge-tts>=7.0.0",
+  "python-dotenv>=1.0.1",
+  "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+asr = [
+  "faster-whisper>=1.1.0",
+]
+
+[project.scripts]
+videocut = "videocut.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
