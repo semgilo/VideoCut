@@ -116,6 +116,18 @@ git clone https://github.com/FunAudioLLM/CosyVoice.git .vendor/CosyVoice
 
 然后把 `VIDEOCUT_COSYVOICE_MODEL_DIR` 指向你已经下载好的模型目录。
 
+实际使用里，建议给 `CosyVoice` 单独准备一个 Python 环境，例如：
+
+```bash
+python3.11 -m venv .venv-cosyvoice
+source .venv-cosyvoice/bin/activate
+pip install -r .vendor/CosyVoice/requirements.txt
+```
+
+然后把 `VIDEOCUT_COSYVOICE_PYTHON` 指到这个解释器路径，比如 `./.venv-cosyvoice/bin/python`。
+
+注意：`CosyVoice` 第一次运行时，可能还会从 `ModelScope` 下载额外的前端资源，所以首跑通常需要联网。
+
 ## 配置
 
 先复制环境变量模板：
@@ -195,6 +207,7 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
 ```bash
 videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
   --tts-provider cosyvoice \
+  --cosyvoice-python ./.venv-cosyvoice/bin/python \
   --cosyvoice-repo /absolute/path/to/CosyVoice \
   --cosyvoice-model /absolute/path/to/Fun-CosyVoice3-0.5B
 ```
@@ -232,6 +245,18 @@ python scripts/render_from_manifest.py \
   --voice zh-CN-YunxiNeural
 ```
 
+如果你想基于同一个 manifest 切到 `CosyVoice` 重渲，可以显式指定独立解释器：
+
+```bash
+python scripts/render_from_manifest.py \
+  --manifest /absolute/path/to/manifest.json \
+  --output-dir /absolute/path/to/rerender-cosy \
+  --tts-provider cosyvoice \
+  --cosyvoice-python ./.venv-cosyvoice/bin/python \
+  --cosyvoice-repo .vendor/CosyVoice \
+  --cosyvoice-model .vendor/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B
+```
+
 ### 重写过长字幕
 
 这个脚本会扫描 `manifest.json` 里播放倍率过高的句子，调用本地 `ollama` 模型把中文改写得更短，再输出一个新的 manifest：
@@ -250,6 +275,13 @@ python scripts/rewrite_dub_manifest.py \
 - 字幕质量受原字幕或 ASR 质量影响
 - 翻译质量、术语一致性取决于你配置的模型
 - `CosyVoice` 在 macOS 上通常比 `edge-tts` 慢很多，长视频需要预留时间
+
+## 实战建议
+
+- `CosyVoice` 更适合作为最终成片阶段的渲染器，不适合拿来做最快速的流程验证。更实用的做法通常是先用 `edge-tts` 检查时轴，再缩短过长句子，最后切回 `CosyVoice`。
+- 英文人名、品牌名、频道名和片尾宣传口播，常常会在 `CosyVoice` 里被念得很长。把它们改写成更短的中文表达，通常比一味提高 `VIDEOCUT_MAX_PLAYBACK_RATE` 更有效。
+- 当前实现里，`CosyVoice` 是按字幕片段逐句串行合成的。短视频都可能要跑很多分钟，1 小时级别的视频更适合当成过夜任务，而不是即时任务。
+- 对长视频，建议先拆成较短片段处理，先验证字幕和时轴，再基于 `manifest.json` 做最终重渲。
 
 ## 合规提醒
 

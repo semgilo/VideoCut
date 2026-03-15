@@ -117,6 +117,18 @@ git clone https://github.com/FunAudioLLM/CosyVoice.git .vendor/CosyVoice
 
 Then point `VIDEOCUT_COSYVOICE_MODEL_DIR` to your downloaded model directory.
 
+In practice, it is often cleaner to keep a dedicated Python environment for `CosyVoice`, for example:
+
+```bash
+python3.11 -m venv .venv-cosyvoice
+source .venv-cosyvoice/bin/activate
+pip install -r .vendor/CosyVoice/requirements.txt
+```
+
+Then set `VIDEOCUT_COSYVOICE_PYTHON` to that interpreter path, such as `./.venv-cosyvoice/bin/python`.
+
+Note: the first `CosyVoice` run may download extra frontend assets from `ModelScope` at runtime. Plan for network access on the first run.
+
 ## Configuration
 
 Copy the environment template:
@@ -196,6 +208,7 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
 ```bash
 videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
   --tts-provider cosyvoice \
+  --cosyvoice-python ./.venv-cosyvoice/bin/python \
   --cosyvoice-repo /absolute/path/to/CosyVoice \
   --cosyvoice-model /absolute/path/to/Fun-CosyVoice3-0.5B
 ```
@@ -233,6 +246,18 @@ python scripts/render_from_manifest.py \
   --voice zh-CN-YunxiNeural
 ```
 
+If you want to re-render the same manifest with `CosyVoice`, use the dedicated interpreter explicitly:
+
+```bash
+python scripts/render_from_manifest.py \
+  --manifest /absolute/path/to/manifest.json \
+  --output-dir /absolute/path/to/rerender-cosy \
+  --tts-provider cosyvoice \
+  --cosyvoice-python ./.venv-cosyvoice/bin/python \
+  --cosyvoice-repo .vendor/CosyVoice \
+  --cosyvoice-model .vendor/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B
+```
+
 ### Rewrite segments that were forced too fast
 
 This helper scans a manifest for segments whose playback rate exceeded a threshold, asks a local `ollama` model to shorten them, and writes a rewritten manifest:
@@ -251,6 +276,13 @@ python scripts/rewrite_dub_manifest.py \
 - Subtitle quality depends on source captions or ASR quality
 - Translation quality and terminology consistency depend on the configured model
 - `CosyVoice` local inference can be much slower than `edge-tts`, especially on macOS
+
+## Practical Notes
+
+- `CosyVoice` is best treated as a final-pass renderer, not the fastest way to validate a pipeline. For timing checks, many teams first run `edge-tts`, shorten lines that are too long, and only then switch to `CosyVoice`.
+- English names, brand names, channel names, and outro promotion lines can expand a lot in `CosyVoice`. Converting them into shorter Chinese phrasing often improves sync more than raising `VIDEOCUT_MAX_PLAYBACK_RATE`.
+- On the current implementation, `CosyVoice` synthesis is serial per subtitle segment. A short-form video can already take many minutes, and a one-hour video should be treated as an overnight job rather than an interactive run.
+- For long videos, prefer splitting work into shorter chunks, validating subtitles and timing first, and then re-rendering from `manifest.json`.
 
 ## Compliance
 
