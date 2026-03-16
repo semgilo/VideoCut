@@ -12,6 +12,19 @@ from videocut.shell import run_command
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm")
 INFO_EXTENSIONS = (".info.json",)
 THUMBNAIL_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+YTDLP_REMOTE_COMPONENTS = "ejs:github"
+YTDLP_PREFERRED_VIDEO_FORMAT = (
+    "bestvideo*[height=1080][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo*[height=1080]+bestaudio/"
+    "best[height=1080]/"
+    "bestvideo*[height=720][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo*[height=720]+bestaudio/"
+    "best[height=720]/"
+    "bestvideo*[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo*[height<=1080]+bestaudio/"
+    "best[height<=1080]/"
+    "best"
+)
 
 
 @dataclass(slots=True)
@@ -31,6 +44,8 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
         [
             "yt-dlp",
             "--no-playlist",
+            "--remote-components",
+            YTDLP_REMOTE_COMPONENTS,
             "--write-subs",
             "--write-auto-subs",
             "--write-info-json",
@@ -42,7 +57,7 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
             "--convert-subs",
             "vtt",
             "-f",
-            "bv*+ba/b",
+            YTDLP_PREFERRED_VIDEO_FORMAT,
             "--merge-output-format",
             "mp4",
             "-o",
@@ -56,6 +71,8 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
                 [
                     "yt-dlp",
                     "--skip-download",
+                    "--remote-components",
+                    YTDLP_REMOTE_COMPONENTS,
                     "--write-subs",
                     "--write-auto-subs",
                     "--sub-langs",

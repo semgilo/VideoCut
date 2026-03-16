@@ -222,6 +222,7 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
 This now uses `CosyVoice` by default when the local repo and model paths are available.
+YouTube downloads now prefer `1080p`, then `720p`, and only then fall back to lower resolutions.
 
 ### Choose a custom work directory
 
@@ -354,6 +355,7 @@ python scripts/rewrite_dub_manifest.py \
 - Subtitle quality depends on source captions or ASR quality
 - Translation quality and terminology consistency depend on the configured model
 - `CosyVoice` local inference can be much slower than `edge-tts`, especially on macOS
+- High-resolution YouTube formats may depend on `yt-dlp` challenge solving. The downloader now enables `--remote-components ejs:github` by default to improve access to 720p/1080p formats.
 
 ## Practical Notes
 

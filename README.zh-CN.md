@@ -221,6 +221,7 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
 默认会优先使用 `CosyVoice`，只要本地仓库和模型路径可用即可。
+YouTube 视频下载现在默认优先拿 `1080p`，没有再拿 `720p`，再没有才继续往下回退。
 
 ### 指定工作目录
 
@@ -353,6 +354,7 @@ python scripts/rewrite_dub_manifest.py \
 - 字幕质量受原字幕或 ASR 质量影响
 - 翻译质量、术语一致性取决于你配置的模型
 - `CosyVoice` 在 macOS 上通常比 `edge-tts` 慢很多，长视频需要预留时间
+- YouTube 的高分辨率格式有时依赖 `yt-dlp` 的挑战求解。下载器现在默认启用 `--remote-components ejs:github`，以提高 720p/1080p 格式的可见性和可下载性。
 
 ## 实战建议
 
