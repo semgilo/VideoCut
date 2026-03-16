@@ -7,10 +7,12 @@ from videocut.config import PipelineConfig
 from videocut.downloader import download_youtube_assets
 from videocut.media import (
     compose_dubbed_track,
+    finalize_synthesized_segments,
     ffprobe_duration,
     render_final_video,
     write_manifest,
 )
+from videocut.publish import export_publish_assets
 from videocut.subtitles import (
     load_chinese_segments_from_vtt,
     load_segments_from_vtt,
@@ -62,8 +64,8 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         raise RuntimeError("No subtitle or transcription segments were produced.")
 
     print(f"Segments ready: {len(segments)}")
+    translator = None
     if config.llm_api_key:
-        print("Translating subtitles...")
         translator = OpenAICompatibleTranslator(
             base_url=config.llm_base_url,
             api_key=config.llm_api_key,
@@ -71,6 +73,7 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
             timeout=config.llm_timeout,
             batch_size=config.translation_batch_size,
         )
+        print("Translating subtitles...")
         translator.translate(segments)
     elif download.chinese_subtitle_path is not None:
         if download.english_subtitle_path is not None:
@@ -90,6 +93,18 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
             "Set VIDEOCUT_LLM_API_KEY or use a video that has zh-Hans subtitles."
         )
 
+    localized_metadata = download.source_metadata
+    if download.source_metadata is not None and translator is not None:
+        print("Translating title, tags, and description...")
+        try:
+            localized_metadata = translator.translate_metadata(download.source_metadata)
+        except Exception as error:
+            print(f"Warning: metadata translation failed, keeping original metadata: {error}")
+    elif download.source_metadata is None:
+        print("Warning: source metadata was not downloaded, publish assets will be partial.")
+    else:
+        print("No translation API key configured. Source title, tags, and description are kept as-is.")
+
     print("Synthesizing Chinese dubbing...")
     synthesize_segments(
         segments=segments,
@@ -97,10 +112,19 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         config=config,
         source_video=download.video_path,
     )
-    for segment in segments:
-        if segment.audio_path is None:
-            raise RuntimeError(f"Segment {segment.index} did not produce an audio file")
-        segment.synthetic_duration = ffprobe_duration(segment.audio_path)
+    trimmed_segments, total_leading_trim, total_trailing_trim = finalize_synthesized_segments(
+        segments=segments,
+        trim_silence=config.trim_tts_silence,
+        silence_threshold_db=config.tts_silence_threshold_db,
+        min_silence_duration=config.tts_silence_min_duration,
+        keep_silence=config.tts_keep_silence,
+    )
+    if trimmed_segments:
+        print(
+            "Trimmed TTS silence: "
+            f"{trimmed_segments} segments, "
+            f"{total_leading_trim:.2f}s leading and {total_trailing_trim:.2f}s trailing removed"
+        )
 
     video_duration = ffprobe_duration(download.video_path)
     plan_dubbing_timing(
@@ -141,14 +165,25 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         subtitle_font=config.subtitle_font,
         subtitle_font_size=config.subtitle_font_size,
     )
+    publish_assets = export_publish_assets(
+        output_dir=run_dir,
+        source_metadata=download.source_metadata,
+        localized_metadata=localized_metadata,
+        cover_image_path=download.thumbnail_path,
+        final_video=final_video,
+    )
     write_manifest(
         path=run_dir / "manifest.json",
         source_video=download.video_path,
         subtitle_source=download.english_subtitle_path or download.chinese_subtitle_path,
+        thumbnail_source=download.thumbnail_path,
         generated_srt=generated_srt,
         dubbed_track=dubbed_track,
         final_video=final_video,
         segments=segments,
+        source_metadata=download.source_metadata,
+        localized_metadata=localized_metadata,
+        publish_assets=publish_assets,
     )
     print(f"Final video exported: {final_video}")
     return final_video

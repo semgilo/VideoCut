@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -13,6 +13,8 @@ class Segment:
     chinese: str = ""
     audio_path: Path | None = None
     synthetic_duration: float | None = None
+    leading_silence: float = 0.0
+    trailing_silence: float = 0.0
     scheduled_start: float | None = None
     scheduled_end: float | None = None
     playback_rate: float = 1.0
@@ -32,3 +34,15 @@ class Segment:
     @property
     def render_duration(self) -> float:
         return max(0.01, self.render_end - self.render_start)
+
+
+@dataclass(slots=True)
+class VideoMetadata:
+    title: str
+    description: str = ""
+    tags: list[str] = field(default_factory=list)
+    uploader: str = ""
+    channel: str = ""
+    video_id: str = ""
+    webpage_url: str = ""
+    upload_date: str = ""

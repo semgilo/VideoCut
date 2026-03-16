@@ -9,9 +9,10 @@ It is designed for practical end-to-end processing:
 1. Download a single YouTube video and subtitle tracks with `yt-dlp`
 2. Reuse English subtitles when available, or fall back to ASR
 3. Translate subtitle segments into spoken Simplified Chinese
-4. Generate per-segment Chinese dubbing with `edge-tts` or `CosyVoice`
+4. Generate per-segment Chinese dubbing with `edge-tts`, `MiniMax`, or `CosyVoice`
 5. Reschedule the dubbed speech onto a more natural timeline
 6. Mix the new dub with optional original audio and export the final video with subtitles
+7. Export a publish bundle with cover, translated title, tags, description, and a local preview page
 
 ## What It Can Do
 
@@ -22,18 +23,20 @@ It is designed for practical end-to-end processing:
 - Translate subtitles through an OpenAI-compatible chat-completions API
 - Generate Chinese dubbing with:
   - `edge-tts` for fast cloud TTS
+  - `MiniMax` for faster cloud TTS with higher-quality Chinese voices and optional voice cloning
   - `CosyVoice` for local cross-lingual or zero-shot voice cloning
 - Export:
   - Chinese `.srt`
   - a mixed dubbed audio track
   - a final `.mp4` with burned subtitles or soft subtitles
+  - translated publish metadata and a reusable cover image
 - Save a `manifest.json` that can be re-rendered later with a different TTS setup
 
 ## How The Pipeline Works
 
 ### 1. Asset acquisition
 
-`yt-dlp` downloads the video plus English subtitles or auto-captions. If translation is not configured, VideoCut also tries to fetch Chinese subtitle tracks so the pipeline can still finish without an LLM.
+`yt-dlp` downloads the video, source metadata, thumbnail, plus English subtitles or auto-captions. If translation is not configured, VideoCut also tries to fetch Chinese subtitle tracks so the pipeline can still finish without an LLM.
 
 ### 2. Subtitle normalization
 
@@ -43,18 +46,22 @@ VTT cues are cleaned, overlapping progressive captions are collapsed, and very s
 
 If `VIDEOCUT_LLM_API_KEY` is set, subtitle batches are sent to an OpenAI-compatible `/chat/completions` endpoint. The translator asks for strict JSON output and automatically retries with smaller batches when a request fails.
 
-If no API key is available and a Chinese subtitle track exists, VideoCut skips translation and reuses that track.
+The same translator is also used to localize the source title, tags, and description into Simplified Chinese while preserving proper nouns.
+
+If no API key is available and a Chinese subtitle track exists, VideoCut skips subtitle translation and reuses that track. The publish metadata then stays in the original language.
 
 ### 4. TTS synthesis
 
 Each subtitle segment is synthesized into its own audio file.
 
 - `edge-tts` is the simplest option and works well for fast validation.
+- `MiniMax` is a fast cloud option that can reuse a system voice ID or clone a voice from the source audio.
 - `CosyVoice` can synthesize Chinese with a reference speaker sample:
   - `cross_lingual`: reference audio only
   - `zero_shot`: reference audio plus reference transcript
 
 If no reference audio is provided for `CosyVoice`, VideoCut extracts a prompt clip from the source video automatically.
+If `VIDEOCUT_MINIMAX_VOICE_CLONE=1`, VideoCut also extracts a short prompt clip automatically and caches the cloned voice id under `tts/minimax_voice.json`.
 
 ### 5. Natural timing scheduler
 
@@ -76,6 +83,7 @@ All synthesized segments are delayed onto the planned timeline, time-stretched w
 
 - If the local `ffmpeg` build supports the `subtitles` filter, subtitles are burned into the video.
 - Otherwise, VideoCut falls back to muxing soft subtitles into the final MP4.
+- The source thumbnail is copied into a standard publish asset bundle together with `title.txt`, `tags.txt`, `description.txt`, `metadata.json`, and `content_preview.html`.
 
 ## Requirements
 
@@ -147,24 +155,39 @@ VIDEOCUT_LLM_MODEL=gpt-4o-mini
 
 If the source video already has `zh-Hans`, `zh-CN`, or `zh-Hant` subtitles, VideoCut can still complete without an API key by reusing the Chinese track.
 
-### Fastest TTS path: edge-tts
+### Default TTS path: CosyVoice
+
+```env
+VIDEOCUT_TTS_PROVIDER=cosyvoice
+VIDEOCUT_COSYVOICE_PYTHON=./.venv-cosyvoice/bin/python
+VIDEOCUT_COSYVOICE_REPO_DIR=.vendor/CosyVoice
+VIDEOCUT_COSYVOICE_MODEL_DIR=.vendor/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B
+VIDEOCUT_COSYVOICE_MODE=cross_lingual
+VIDEOCUT_COSYVOICE_GROUP_SIZE=1
+VIDEOCUT_ORIGINAL_AUDIO_VOLUME=0.0
+VIDEOCUT_DUB_AUDIO_VOLUME=1.0
+```
+
+`VIDEOCUT_COSYVOICE_GROUP_SIZE` is optional. Keep `1` for the safest segmentation, or raise it to `2` or `3` on longer videos to synthesize adjacent subtitles together and split them back into per-segment audio automatically.
+
+### Fastest fallback path: edge-tts
 
 ```env
 VIDEOCUT_TTS_PROVIDER=edge
 VIDEOCUT_TTS_VOICE=zh-CN-YunxiNeural
 VIDEOCUT_TTS_RATE=+5%
-VIDEOCUT_ORIGINAL_AUDIO_VOLUME=0.0
-VIDEOCUT_DUB_AUDIO_VOLUME=1.0
 ```
 
-### Higher-fidelity local dubbing: CosyVoice
+### Faster cloud path: MiniMax
 
 ```env
-VIDEOCUT_TTS_PROVIDER=cosyvoice
-VIDEOCUT_COSYVOICE_PYTHON=python3.11
-VIDEOCUT_COSYVOICE_REPO_DIR=/absolute/path/to/CosyVoice
-VIDEOCUT_COSYVOICE_MODEL_DIR=/absolute/path/to/Fun-CosyVoice3-0.5B
-VIDEOCUT_COSYVOICE_MODE=cross_lingual
+VIDEOCUT_TTS_PROVIDER=minimax
+VIDEOCUT_MINIMAX_API_KEY=your_minimax_api_key
+VIDEOCUT_MINIMAX_MODEL=speech-2.8-turbo
+VIDEOCUT_MINIMAX_VOICE_ID=Chinese (Mandarin)_News_Anchor
+VIDEOCUT_MINIMAX_SPEED=1.0
+VIDEOCUT_MINIMAX_CONCURRENCY=4
+VIDEOCUT_MINIMAX_VOICE_CLONE=0
 ```
 
 Optional reference audio:
@@ -182,8 +205,12 @@ These defaults prioritize natural speech over strict subtitle-window matching:
 VIDEOCUT_MAX_PLAYBACK_RATE=1.18
 VIDEOCUT_MAX_SEGMENT_LAG=0.8
 VIDEOCUT_MAX_OPENING_SILENCE=0.35
-VIDEOCUT_MAX_GLOBAL_SHIFT=1.5
+VIDEOCUT_MAX_GLOBAL_SHIFT=2.5
 VIDEOCUT_MIN_SEGMENT_GAP=0.05
+VIDEOCUT_TRIM_TTS_SILENCE=1
+VIDEOCUT_TTS_SILENCE_THRESHOLD_DB=-35
+VIDEOCUT_TTS_SILENCE_MIN_DURATION=0.05
+VIDEOCUT_TTS_KEEP_SILENCE=0.02
 ```
 
 ## Usage
@@ -194,23 +221,61 @@ VIDEOCUT_MIN_SEGMENT_GAP=0.05
 videocut run "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-### Choose a custom work directory and TTS voice
+This now uses `CosyVoice` by default when the local repo and model paths are available.
+
+### Choose a custom work directory
 
 ```bash
 videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
   --workdir runs/demo \
-  --voice zh-CN-YunxiNeural \
   --dub-volume 1.0
 ```
 
-### Use CosyVoice
+### Override the bundled CosyVoice setup
 
 ```bash
 videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --tts-provider cosyvoice \
   --cosyvoice-python ./.venv-cosyvoice/bin/python \
   --cosyvoice-repo /absolute/path/to/CosyVoice \
   --cosyvoice-model /absolute/path/to/Fun-CosyVoice3-0.5B
+```
+
+### Speed up long CosyVoice renders
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --cosyvoice-group-size 3
+```
+
+This batches nearby subtitle lines into a single CosyVoice call, then splits the result back into per-subtitle WAV files using silence-aware boundaries. It is primarily a throughput option for long videos.
+
+### Switch back to edge-tts
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --tts-provider edge \
+  --voice zh-CN-YunxiNeural \
+  --tts-rate +5%
+```
+
+### Try MiniMax
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --tts-provider minimax \
+  --minimax-api-key "$MINIMAX_API_KEY" \
+  --voice "Chinese (Mandarin)_News_Anchor" \
+  --minimax-speed 1.0 \
+  --minimax-concurrency 4
+```
+
+To let MiniMax clone a voice from the source video first:
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --tts-provider minimax \
+  --minimax-api-key "$MINIMAX_API_KEY" \
+  --minimax-voice-clone
 ```
 
 ### Export without burning subtitles
@@ -223,13 +288,19 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID" --no-burn-subtitles
 
 Each run creates a working directory under `runs/` or your custom `--workdir`.
 
-- `source/`: downloaded video, subtitle files, and extracted audio
+- `source/`: downloaded video, subtitle files, thumbnail, source metadata, and extracted audio
 - `subtitles/zh.srt`: generated Chinese subtitles
 - `tts/`: per-segment synthesized audio files
 - `tts/reference_prompt.wav`: auto-extracted reference audio for `CosyVoice`
 - `tts/cosyvoice_inputs.json`: `CosyVoice` batch input manifest
 - `audio/dubbed_track.m4a`: mixed Chinese dub track
-- `final_cn.mp4`: final exported video
+- `final_cn.mp4`: final exported video; if ffmpeg lacks the `subtitles` filter, this falls back to a soft-subtitle MP4
+- `publish/cover.jpg`: copied cover image in a regular image format when available
+- `publish/title.txt`: localized Chinese title
+- `publish/tags.txt`: localized Chinese tags
+- `publish/description.txt`: localized Chinese description
+- `publish/metadata.json`: structured source + localized metadata
+- `publish/content_preview.html`: local preview page for the final video and metadata
 - `manifest.json`: full run manifest for inspection or re-rendering
 
 ## Utility Scripts
@@ -241,21 +312,28 @@ Use this when you already have translated segments and only want to change the T
 ```bash
 python scripts/render_from_manifest.py \
   --manifest /absolute/path/to/manifest.json \
-  --output-dir /absolute/path/to/rerender \
-  --tts-provider edge \
-  --voice zh-CN-YunxiNeural
+  --output-dir /absolute/path/to/rerender-cosy
 ```
 
-If you want to re-render the same manifest with `CosyVoice`, use the dedicated interpreter explicitly:
+This follows the configured default TTS provider, which is `CosyVoice` unless you override it.
+
+You can also raise the CosyVoice batching size during a re-render:
 
 ```bash
 python scripts/render_from_manifest.py \
   --manifest /absolute/path/to/manifest.json \
   --output-dir /absolute/path/to/rerender-cosy \
-  --tts-provider cosyvoice \
-  --cosyvoice-python ./.venv-cosyvoice/bin/python \
-  --cosyvoice-repo .vendor/CosyVoice \
-  --cosyvoice-model .vendor/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B
+  --cosyvoice-group-size 3
+```
+
+To re-render the same manifest with `edge-tts`, switch the provider explicitly:
+
+```bash
+python scripts/render_from_manifest.py \
+  --manifest /absolute/path/to/manifest.json \
+  --output-dir /absolute/path/to/rerender-edge \
+  --tts-provider edge \
+  --voice zh-CN-YunxiNeural
 ```
 
 ### Rewrite segments that were forced too fast
@@ -281,7 +359,7 @@ python scripts/rewrite_dub_manifest.py \
 
 - `CosyVoice` is best treated as a final-pass renderer, not the fastest way to validate a pipeline. For timing checks, many teams first run `edge-tts`, shorten lines that are too long, and only then switch to `CosyVoice`.
 - English names, brand names, channel names, and outro promotion lines can expand a lot in `CosyVoice`. Converting them into shorter Chinese phrasing often improves sync more than raising `VIDEOCUT_MAX_PLAYBACK_RATE`.
-- On the current implementation, `CosyVoice` synthesis is serial per subtitle segment. A short-form video can already take many minutes, and a one-hour video should be treated as an overnight job rather than an interactive run.
+- By default, `CosyVoice` still renders one subtitle at a time. For longer videos, `VIDEOCUT_COSYVOICE_GROUP_SIZE=2` or `3` usually reduces total wall-clock time without changing the final subtitle timing plan.
 - For long videos, prefer splitting work into shorter chunks, validating subtitles and timing first, and then re-rendering from `manifest.json`.
 
 ## Compliance

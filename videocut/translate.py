@@ -6,7 +6,7 @@ from collections.abc import Iterable
 
 import requests
 
-from videocut.models import Segment
+from videocut.models import Segment, VideoMetadata
 
 
 JSON_RE = re.compile(r"\{.*\}", re.S)
@@ -45,30 +45,45 @@ class OpenAICompatibleTranslator:
             "Translate each subtitle item to Simplified Chinese. Preserve the ids exactly.\n"
             f"{json.dumps(payload_segments, ensure_ascii=False)}"
         )
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        content = payload["choices"][0]["message"]["content"]
-        parsed = _extract_json_object(content)
+        parsed = self._complete_json(system_prompt, user_prompt)
         translations = parsed.get("translations")
         if not isinstance(translations, list):
             raise RuntimeError(f"Unexpected translator payload: {parsed}")
         return translations
+
+    def translate_metadata(self, metadata: VideoMetadata) -> VideoMetadata:
+        if not self.api_key:
+            raise RuntimeError(
+                "VIDEOCUT_LLM_API_KEY is empty. Set it in .env or pass --llm-api-key."
+            )
+
+        system_prompt = (
+            "You localize YouTube video metadata into concise, natural Simplified Chinese. "
+            "Translate the title, description, and tags while preserving proper nouns exactly, "
+            "including personal names, brand names, product names, place names, @handles, URLs, "
+            "hashtags, model numbers, and numeric values. Keep the original meaning and tone. "
+            "Do not invent facts or add marketing filler. If source tags are empty, derive a small set "
+            "of grounded tags from the title and description only. "
+            'Return JSON only with this shape: {"title":"...","description":"...","tags":["..."]}.'
+        )
+        user_prompt = (
+            "Localize this metadata to Simplified Chinese while preserving proper nouns:\n"
+            f"{json.dumps(metadata_payload(metadata), ensure_ascii=False)}"
+        )
+        parsed = self._complete_json(system_prompt, user_prompt)
+        translated_tags = parsed.get("tags")
+        if not isinstance(translated_tags, list):
+            raise RuntimeError(f"Unexpected metadata payload: {parsed}")
+        return VideoMetadata(
+            title=str(parsed.get("title") or metadata.title).strip(),
+            description=str(parsed.get("description") or metadata.description).strip(),
+            tags=[str(tag).strip() for tag in translated_tags if str(tag).strip()],
+            uploader=metadata.uploader,
+            channel=metadata.channel,
+            video_id=metadata.video_id,
+            webpage_url=metadata.webpage_url,
+            upload_date=metadata.upload_date,
+        )
 
     def _translate_batch_resilient(self, batch: list[Segment]) -> int:
         try:
@@ -91,6 +106,39 @@ class OpenAICompatibleTranslator:
             return self._translate_batch_resilient(batch[:midpoint]) + self._translate_batch_resilient(
                 batch[midpoint:]
             )
+
+    def _complete_json(self, system_prompt: str, user_prompt: str) -> dict:
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = payload["choices"][0]["message"]["content"]
+        return _extract_json_object(content)
+
+
+def metadata_payload(metadata: VideoMetadata) -> dict[str, object]:
+    return {
+        "title": metadata.title,
+        "description": metadata.description,
+        "tags": metadata.tags,
+        "uploader": metadata.uploader,
+        "channel": metadata.channel,
+        "webpage_url": metadata.webpage_url,
+    }
 
 
 def _extract_json_object(text: str) -> dict:

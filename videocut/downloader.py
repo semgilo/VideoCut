@@ -4,10 +4,14 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from videocut.models import VideoMetadata
+from videocut.publish import load_video_metadata
 from videocut.shell import run_command
 
 
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm")
+INFO_EXTENSIONS = (".info.json",)
+THUMBNAIL_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 
 
 @dataclass(slots=True)
@@ -15,6 +19,9 @@ class DownloadResult:
     video_path: Path
     english_subtitle_path: Path | None
     chinese_subtitle_path: Path | None
+    info_json_path: Path | None
+    thumbnail_path: Path | None
+    source_metadata: VideoMetadata | None
 
 
 def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitles: bool = False) -> DownloadResult:
@@ -26,6 +33,10 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
             "--no-playlist",
             "--write-subs",
             "--write-auto-subs",
+            "--write-info-json",
+            "--write-thumbnail",
+            "--convert-thumbnails",
+            "jpg",
             "--sub-langs",
             "en.*,en",
             "--convert-subs",
@@ -66,10 +77,16 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
         video_path.stem,
         ("zh-Hans", "zh-CN", "zh-Hant"),
     )
+    info_json_path = _pick_related_file(source_dir, video_path.stem, INFO_EXTENSIONS)
+    thumbnail_path = _pick_related_file(source_dir, video_path.stem, THUMBNAIL_EXTENSIONS)
+    source_metadata = load_video_metadata(info_json_path) if info_json_path is not None else None
     return DownloadResult(
         video_path=video_path,
         english_subtitle_path=english_subtitle_path,
         chinese_subtitle_path=chinese_subtitle_path,
+        info_json_path=info_json_path,
+        thumbnail_path=thumbnail_path,
+        source_metadata=source_metadata,
     )
 
 
@@ -101,6 +118,29 @@ def _pick_best_subtitle(source_dir: Path, video_stem: str, languages: tuple[str,
         return (exact_match, lang_score, len(name), path.stat().st_mtime)
 
     matched = [path for path in candidates if score(path)[1] > 0]
+    if not matched:
+        return None
+    return max(matched, key=score)
+
+
+def _pick_related_file(source_dir: Path, video_stem: str, extensions: tuple[str, ...]) -> Path | None:
+    candidates = []
+    for path in source_dir.iterdir():
+        if not path.is_file():
+            continue
+        suffix = "".join(path.suffixes).lower()
+        if suffix in extensions:
+            candidates.append(path)
+    if not candidates:
+        return None
+
+    def score(path: Path) -> tuple[int, int, float]:
+        stem = path.name[: -len("".join(path.suffixes))] if path.suffixes else path.stem
+        exact_match = int(stem == video_stem)
+        prefix_match = int(stem.startswith(video_stem) or video_stem.startswith(stem))
+        return (exact_match, prefix_match, path.stat().st_mtime)
+
+    matched = [path for path in candidates if score(path)[:2] != (0, 0)]
     if not matched:
         return None
     return max(matched, key=score)
