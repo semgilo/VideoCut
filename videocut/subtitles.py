@@ -146,13 +146,19 @@ def _merge_short_cues(cues: list[tuple[float, float, str]]) -> list[tuple[float,
     merged: list[list[float | str]] = [[cues[0][0], cues[0][1], cues[0][2]]]
     for start, end, text in cues[1:]:
         prev_start, prev_end, prev_text = merged[-1]
-        joinable = (
-            start - float(prev_end) <= 0.35
-            and len(str(prev_text)) + len(text) <= 140
-            and not str(prev_text).endswith((".", "?", "!", ",")) 
+        prev_duration = float(prev_end) - float(prev_start)
+        current_duration = end - start
+        combined_duration = end - float(prev_start)
+        joinable = _should_merge_short_cue(
+            previous_text=str(prev_text),
+            text=text,
+            gap=start - float(prev_end),
+            previous_duration=prev_duration,
+            current_duration=current_duration,
+            combined_duration=combined_duration,
         )
-        if joinable and text.lower() not in str(prev_text).lower():
-            merged[-1] = [prev_start, end, f"{prev_text} {text}".strip()]
+        if joinable:
+            merged[-1] = [prev_start, end, _merge_adjacent_text(str(prev_text), text)]
             continue
         merged.append([start, end, text])
     return [(float(start), float(end), str(text)) for start, end, text in merged]
@@ -206,8 +212,40 @@ def _wrap_text(text: str, line_length: int = 18) -> str:
     text = text.strip()
     if len(text) <= line_length:
         return text
-    chunks = [text[i : i + line_length] for i in range(0, len(text), line_length)]
-    return "\n".join(chunks[:2])
+    lines: list[str] = []
+    remainder = text
+    while len(remainder) > line_length:
+        line_break = _find_wrap_break(remainder, line_length)
+        if line_break <= 0 or line_break >= len(remainder):
+            line_break = line_length
+        lines.append(remainder[:line_break].rstrip())
+        remainder = remainder[line_break:].lstrip()
+    if remainder:
+        lines.append(remainder)
+    return "\n".join(lines)
+
+
+def _find_wrap_break(text: str, target: int) -> int:
+    if len(text) <= target:
+        return len(text)
+
+    lower_bound = max(1, target - 6)
+    upper_bound = min(len(text) - 1, target + 6)
+    punctuation = "，。！？；：,.!?;:"
+    candidates: list[tuple[int, int]] = []
+
+    for index in range(lower_bound, upper_bound + 1):
+        left_char = text[index - 1]
+        right_char = text[index]
+        if left_char in punctuation or left_char.isspace() or right_char.isspace():
+            penalty = abs(index - target)
+            if left_char in punctuation:
+                penalty -= 1
+            candidates.append((penalty, index))
+
+    if candidates:
+        return min(candidates)[1]
+    return target
 
 
 def _normalized_startswith(text: str, prefix: str) -> bool:
@@ -251,6 +289,48 @@ def _collapse_immediate_repetition(text: str, min_words: int = 3) -> str:
             if changed:
                 break
     return " ".join(words).strip()
+
+
+def _should_merge_short_cue(
+    previous_text: str,
+    text: str,
+    gap: float,
+    previous_duration: float,
+    current_duration: float,
+    combined_duration: float,
+) -> bool:
+    if gap > 0.2:
+        return False
+    if combined_duration > 3.6:
+        return False
+    if len(previous_text) + len(text) > 120:
+        return False
+    if previous_text.rstrip().endswith((".", "?", "!", "。", "？", "！")):
+        return False
+
+    previous_words = len(previous_text.split())
+    current_words = len(text.split())
+    return (
+        previous_duration <= 0.18
+        or previous_words <= 3
+        or (previous_duration <= 1.25 and previous_words <= 6)
+        or current_duration <= 0.35
+        or current_words <= 2
+    )
+
+
+def _merge_adjacent_text(previous_text: str, text: str) -> str:
+    if _normalized_startswith(text, previous_text):
+        return _collapse_immediate_repetition(text)
+    if _normalized_startswith(previous_text, text):
+        return _collapse_immediate_repetition(previous_text)
+
+    remainder = _strip_leading_word_overlap(text, previous_text)
+    if remainder:
+        combined = f"{previous_text} {remainder}".strip()
+    else:
+        combined = previous_text
+    return _collapse_immediate_repetition(combined)
 
 
 def _normalize_for_overlap(text: str) -> str:

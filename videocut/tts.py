@@ -669,26 +669,48 @@ def _select_reference_window(segments: list[Segment]) -> tuple[list[Segment], fl
     if not candidates:
         raise RuntimeError("No subtitle segments are available to build a CosyVoice reference clip.")
 
-    selected: list[Segment] = []
-    clip_start = max(0.0, candidates[0].start - 0.2)
-    clip_end = candidates[0].end
-    target_window = 24.0
-    # CosyVoice prompt audio must stay under 30 seconds.
-    max_window = 29.5
+    # Voice-clone prompts work better when the reference clip is short, dense,
+    # and mostly uninterrupted speech instead of a long 20s+ montage.
+    target_window = 8.0
+    minimum_window = 4.5
+    max_window = 10.0
+    best_choice: tuple[tuple[float, float, float, int], list[Segment], float, float] | None = None
 
-    for segment in candidates:
-        proposed_end = max(clip_end, segment.end + 0.2)
-        if proposed_end - clip_start > max_window and selected:
-            break
-        selected.append(segment)
-        clip_end = min(proposed_end, clip_start + max_window)
-        if clip_end - clip_start >= target_window and len(selected) >= 4:
-            break
+    for start_index, first_segment in enumerate(candidates):
+        selected: list[Segment] = []
+        clip_start = max(0.0, first_segment.start - 0.15)
+        clip_end = first_segment.end
 
-    if not selected:
-        selected.append(candidates[0])
-        clip_end = min(max(clip_end, candidates[0].end + 0.2), clip_start + max_window)
+        for segment in candidates[start_index:]:
+            proposed_end = max(clip_end, segment.end + 0.15)
+            if proposed_end - clip_start > max_window and selected:
+                break
+            selected.append(segment)
+            clip_end = min(proposed_end, clip_start + max_window)
 
+            window = clip_end - clip_start
+            speech = sum(max(0.01, item.end - item.start) for item in selected)
+            coverage = speech / max(window, 0.01)
+            text_length = sum(len((item.english or item.chinese).strip()) for item in selected)
+            score = (
+                1.0 if window >= minimum_window else 0.0,
+                -abs(window - target_window),
+                coverage,
+                text_length,
+            )
+            if best_choice is None or score > best_choice[0]:
+                best_choice = (score, list(selected), clip_start, clip_end)
+
+            if window >= target_window and len(selected) >= 2:
+                break
+
+    if best_choice is None:
+        selected = [candidates[0]]
+        clip_start = max(0.0, candidates[0].start - 0.15)
+        clip_end = min(candidates[0].end + 0.15, clip_start + max_window)
+        return selected, clip_start, clip_end
+
+    _, selected, clip_start, clip_end = best_choice
     return selected, clip_start, clip_end
 
 
