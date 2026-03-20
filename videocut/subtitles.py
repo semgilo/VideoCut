@@ -89,6 +89,11 @@ def _parse_vtt_cues(path: Path) -> list[tuple[float, float, str]]:
     for line in lines:
         stripped = line.strip()
         if not stripped:
+            # Some WebVTT exporters emit an empty spacer line right after the
+            # timestamp row and before the cue text. Treat that as part of the
+            # current cue instead of closing it immediately.
+            if start is not None and not cue_lines:
+                continue
             flush()
             continue
         if stripped.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")):

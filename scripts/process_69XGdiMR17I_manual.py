@@ -17,29 +17,35 @@ from videocut.media import (
 from videocut.models import Segment, VideoMetadata
 from videocut.publish import export_publish_assets, load_video_metadata
 from videocut.shell import run_command
-from videocut.subtitles import write_srt
-from videocut.timing import plan_dubbing_timing
+from videocut.subtitles import load_segments_from_vtt, write_srt
+from videocut.timing import plan_dubbing_timing, validate_source_segment_coverage
 from videocut.tts import synthesize_segments
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_RUN_DIR = REPO_ROOT / "runs" / "69XGdiMR17I-20260320"
-RUN_DIR = REPO_ROOT / "runs" / "69XGdiMR17I-cosyvoice-fixed-v3"
+RUN_DIR = REPO_ROOT / "runs" / "69XGdiMR17I-cosyvoice-fixed-v4"
 
 
 SEGMENT_DATA: list[tuple[float, float, str, str]] = [
     (
-        2.79,
+        0.32,
+        2.80,
+        "OpenClaw plus Nvidia Nemotron 3 Super.",
+        "OpenClaw 加 Nvidia Nemotron 3 Super。",
+    ),
+    (
+        2.80,
         15.44,
         (
-            "OpenClaw plus Nemotron 3 Super plus Ollama is insane. "
+            "Plus Ollama is insane. "
             "Nvidia just released the 120-billion-parameter Nemotron 3 Super, "
             "and it runs free with OpenClaw. It also has a 256,000-token context window."
         ),
         (
-            "OpenClaw 配 Nemotron 3 Super 再加 Ollama，强得离谱。"
-            "Nvidia 刚发了 1200 亿参数的 Nemotron 3 Super，"
-            "它能在 OpenClaw 里免费运行，还带有 25.6 万 token 上下文。"
+            "再加上 Ollama，简直离谱。"
+            "Nvidia 刚发布 1200 亿参数的 Nemotron 3 Super，"
+            "在 OpenClaw 里就能免费跑，还带 25.6 万 token 上下文。"
         ),
     ),
     (
@@ -121,6 +127,12 @@ def main() -> None:
         Segment(index=index, start=start, end=end, english=english, chinese=chinese)
         for index, (start, end, english, chinese) in enumerate(SEGMENT_DATA, start=1)
     ]
+    source_segments = load_segments_from_vtt(subtitle_source)
+    validate_source_segment_coverage(
+        source_segments=source_segments,
+        target_segments=segments,
+        max_uncovered_duration=0.25,
+    )
 
     localized_metadata = VideoMetadata(
         title="OpenClaw + Nvidia Nemotron 3 Super + Ollama，强到离谱！",
