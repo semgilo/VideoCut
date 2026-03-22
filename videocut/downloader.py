@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,11 @@ class DownloadResult:
 
 def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitles: bool = False) -> DownloadResult:
     source_dir.mkdir(parents=True, exist_ok=True)
+    existing_download = _load_existing_download(source_dir)
+    if existing_download is not None:
+        print(f"Reusing existing downloaded source assets from {source_dir}")
+        return existing_download
+
     output_template = str(source_dir / "%(title).120B [%(id)s].%(ext)s")
     run_command(
         [
@@ -107,6 +113,31 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
     )
 
 
+def _load_existing_download(source_dir: Path) -> DownloadResult | None:
+    try:
+        video_path = _pick_latest_video(source_dir)
+    except FileNotFoundError:
+        return None
+
+    english_subtitle_path = _pick_best_subtitle(source_dir, video_path.stem, ("en", "en-orig"))
+    chinese_subtitle_path = _pick_best_subtitle(
+        source_dir,
+        video_path.stem,
+        ("zh-Hans", "zh-CN", "zh-Hant"),
+    )
+    info_json_path = _pick_related_file(source_dir, video_path.stem, INFO_EXTENSIONS)
+    thumbnail_path = _pick_related_file(source_dir, video_path.stem, THUMBNAIL_EXTENSIONS)
+    source_metadata = load_video_metadata(info_json_path) if info_json_path is not None else None
+    return DownloadResult(
+        video_path=video_path,
+        english_subtitle_path=english_subtitle_path,
+        chinese_subtitle_path=chinese_subtitle_path,
+        info_json_path=info_json_path,
+        thumbnail_path=thumbnail_path,
+        source_metadata=source_metadata,
+    )
+
+
 def _pick_latest_video(source_dir: Path) -> Path:
     candidates = [
         path
@@ -115,7 +146,58 @@ def _pick_latest_video(source_dir: Path) -> Path:
     ]
     if not candidates:
         raise FileNotFoundError("yt-dlp completed but no video file was found in source/")
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    return max(candidates, key=_video_sort_key)
+
+
+def _video_sort_key(path: Path) -> tuple[int, int, int, int, int, float]:
+    width, height = _probe_video_size(path)
+    clamped_height = min(height, 1080)
+    clamped_width = min(width, 1920)
+    exact_1080p = int(height == 1080)
+    hd_bucket = int(height >= 720)
+    mp4_priority = int(path.suffix.lower() == ".mp4")
+    return (
+        exact_1080p,
+        clamped_height,
+        clamped_width,
+        hd_bucket,
+        mp4_priority,
+        path.stat().st_mtime,
+    )
+
+
+def _probe_video_size(path: Path) -> tuple[int, int]:
+    try:
+        output = run_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            log_command=False,
+        )
+        payload = json.loads(output)
+    except (subprocess.CalledProcessError, ValueError, KeyError, json.JSONDecodeError):
+        return (0, 0)
+
+    streams = payload.get("streams") or []
+    if not streams:
+        return (0, 0)
+    stream = streams[0]
+    try:
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+    except (TypeError, ValueError):
+        return (0, 0)
+    return (max(0, width), max(0, height))
 
 
 def _pick_best_subtitle(source_dir: Path, video_stem: str, languages: tuple[str, ...]) -> Path | None:

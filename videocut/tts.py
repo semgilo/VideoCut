@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import shlex
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -111,8 +112,17 @@ def synthesize_segments(
             source_video=source_video,
         )
         return
+    if provider == "command":
+        _synthesize_segments_with_command(
+            segments=segments,
+            output_dir=output_dir,
+            config=config,
+            source_video=source_video,
+        )
+        return
     raise RuntimeError(
-        f"Unsupported TTS provider: {config.tts_provider}. Expected one of: edge, minimax, cosyvoice."
+        "Unsupported TTS provider: "
+        f"{config.tts_provider}. Expected one of: edge, minimax, cosyvoice, command."
     )
 
 
@@ -135,7 +145,7 @@ def _synthesize_segments_with_minimax(
         segments=segments,
         source_video=source_video,
     )
-    suffix = _minimax_audio_suffix(config.minimax_audio_format)
+    suffix = _audio_format_suffix(config.minimax_audio_format)
     pending_segments: list[Segment] = []
     reused = 0
     for segment in segments:
@@ -479,14 +489,92 @@ def _raise_for_minimax_error(payload: dict, fallback: str) -> None:
     raise RuntimeError(f"{fallback}: [{status_code}] {status_msg}")
 
 
-def _minimax_audio_suffix(audio_format: str) -> str:
+def _audio_format_suffix(audio_format: str) -> str:
     normalized = audio_format.strip().lower()
-    if normalized in {"mp3", "wav", "flac"}:
+    if normalized in {"mp3", "wav", "m4a", "aac", "flac"}:
         return normalized
     raise RuntimeError(
-        "VideoCut currently supports MiniMax output formats mp3, wav, and flac. "
+        "VideoCut currently supports audio output formats mp3, wav, m4a, aac, and flac. "
         f"Received: {audio_format!r}"
     )
+
+
+def _synthesize_segments_with_command(
+    segments: list[Segment],
+    output_dir: Path,
+    config: PipelineConfig,
+    source_video: Path | None,
+) -> None:
+    raw_command = config.tts_command.strip()
+    if not raw_command:
+        raise RuntimeError(
+            "VIDEOCUT_TTS_COMMAND is empty. Set it in .env or pass --tts-command when using "
+            "--tts-provider command."
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prompt_audio_path, prompt_text = _prepare_optional_reference_material(
+        segments=segments,
+        output_dir=output_dir,
+        config=config,
+        source_video=source_video,
+    )
+    suffix = _audio_format_suffix(config.tts_command_audio_format)
+    pending_segments: list[Segment] = []
+    reused = 0
+    for segment in segments:
+        if not segment.chinese:
+            raise RuntimeError(f"Segment {segment.index} is missing Chinese text for TTS")
+        segment.audio_path = output_dir / f"{segment.index:04d}.{suffix}"
+        if segment.audio_path.exists() and segment.audio_path.stat().st_size > 0:
+            reused += 1
+            continue
+        pending_segments.append(segment)
+
+    manifest_path = output_dir / "tts_command_inputs.json"
+    manifest_payload = {
+        "source_video": str(source_video) if source_video is not None else None,
+        "prompt_audio": str(prompt_audio_path) if prompt_audio_path is not None else None,
+        "prompt_text": prompt_text,
+        "segments": [
+            {
+                "index": segment.index,
+                "english": segment.english,
+                "text": segment.chinese,
+                "audio_path": str(segment.audio_path),
+                "target_duration": segment.duration,
+            }
+            for segment in pending_segments
+        ],
+    }
+    manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if reused:
+        print(f"Reused {reused} existing command-provider segments from {output_dir}")
+    if not pending_segments:
+        print("All command-provider segments already exist; skipping synthesis.")
+        return
+
+    cmd = shlex.split(raw_command)
+    cmd.extend(["--input-json", str(manifest_path)])
+    print(
+        "Synthesizing Chinese dubbing with external command provider "
+        f"({len(pending_segments)} new / {len(segments)} total segments)..."
+    )
+    run_command(cmd)
+
+    missing_outputs = [
+        segment.index
+        for segment in pending_segments
+        if segment.audio_path is None
+        or not segment.audio_path.exists()
+        or segment.audio_path.stat().st_size <= 0
+    ]
+    if missing_outputs:
+        raise RuntimeError(
+            "External TTS command finished without writing all requested segment files. "
+            f"Missing segment ids: {missing_outputs[:10]}"
+        )
 
 
 def _synthesize_segments_with_cosyvoice(
@@ -552,7 +640,14 @@ def _synthesize_segments_with_cosyvoice(
         f"({config.cosyvoice_mode}, {len(pending_segments)} new / {len(segments)} total segments, "
         f"group size {group_size})..."
     )
-    run_command(cmd)
+    run_command(
+        cmd,
+        env={
+            # Some CosyVoice vocoder ops still fall back on CPU when PyTorch MPS
+            # lacks kernel coverage on macOS.
+            "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+        },
+    )
 
 
 def _build_cosyvoice_input_manifest(
@@ -661,6 +756,51 @@ def _prepare_reference_material(
             "CosyVoice zero_shot mode requires reference text, but no English subtitle text was available "
             "for the extracted reference clip."
         )
+    return prompt_audio_path, prompt_text
+
+
+def _prepare_optional_reference_material(
+    segments: list[Segment],
+    output_dir: Path,
+    config: PipelineConfig,
+    source_video: Path | None,
+) -> tuple[Path | None, str]:
+    prompt_text = config.reference_text.strip()
+
+    if config.reference_audio_path:
+        prompt_audio_path = Path(config.reference_audio_path).expanduser().resolve()
+        if not prompt_audio_path.exists():
+            raise FileNotFoundError(f"Reference audio file not found: {prompt_audio_path}")
+        return prompt_audio_path, prompt_text
+
+    if source_video is None:
+        return None, prompt_text
+
+    selected_segments, clip_start, clip_end = _select_reference_window(segments)
+    prompt_audio_path = output_dir / "reference_prompt.wav"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{clip_start:.3f}",
+            "-to",
+            f"{clip_end:.3f}",
+            "-i",
+            str(source_video),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "22050",
+            "-c:a",
+            "pcm_s16le",
+            str(prompt_audio_path),
+        ]
+    )
+    if not prompt_text:
+        prompt_text = " ".join(segment.english.strip() for segment in selected_segments if segment.english).strip()
     return prompt_audio_path, prompt_text
 
 

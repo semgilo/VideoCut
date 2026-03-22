@@ -9,7 +9,7 @@ It is designed for practical end-to-end processing:
 1. Download a single YouTube video and subtitle tracks with `yt-dlp`
 2. Reuse English subtitles when available, or fall back to ASR
 3. Translate subtitle segments into spoken Simplified Chinese
-4. Generate per-segment Chinese dubbing with `edge-tts`, `MiniMax`, or `CosyVoice`
+4. Generate per-segment Chinese dubbing with `edge-tts`, `MiniMax`, `CosyVoice`, or an external adapter command
 5. Reschedule the dubbed speech onto a more natural timeline
 6. Mix the new dub with optional original audio and export the final video with subtitles
 7. Export a publish bundle with cover, translated title, tags, description, and a local preview page
@@ -19,12 +19,13 @@ It is designed for practical end-to-end processing:
 - Download one YouTube video at a time
 - Prefer existing English subtitle tracks for better alignment and lower cost
 - Fall back to `faster-whisper` transcription if no English subtitle track exists
-- Reuse YouTube Chinese subtitle tracks directly when no translation API key is configured
+- Reuse YouTube Chinese subtitle tracks directly when no translation endpoint is configured
 - Translate subtitles through an OpenAI-compatible chat-completions API
 - Generate Chinese dubbing with:
   - `edge-tts` for fast cloud TTS
   - `MiniMax` for faster cloud TTS with higher-quality Chinese voices and optional voice cloning
   - `CosyVoice` for local cross-lingual or zero-shot voice cloning
+  - `command` for plugging in a local adapter script around tools such as Fish Speech, RVC, or so-vits-svc
 - Export:
   - Chinese `.srt`
   - a mixed dubbed audio track
@@ -44,11 +45,11 @@ VTT cues are cleaned, overlapping progressive captions are collapsed, and very s
 
 ### 3. Translation
 
-If `VIDEOCUT_LLM_API_KEY` is set, subtitle batches are sent to an OpenAI-compatible `/chat/completions` endpoint. The translator asks for strict JSON output and automatically retries with smaller batches when a request fails.
+If `VIDEOCUT_LLM_BASE_URL` and `VIDEOCUT_LLM_MODEL` are configured, subtitle batches are sent to an OpenAI-compatible `/chat/completions` endpoint. Remote endpoints usually still need `VIDEOCUT_LLM_API_KEY`, but local endpoints such as `http://127.0.0.1:8000/v1` can be used without a key. The translator asks for strict JSON output and automatically retries with smaller batches when a request fails.
 
 The same translator is also used to localize the source title, tags, and description into Simplified Chinese while preserving proper nouns.
 
-If no API key is available and a Chinese subtitle track exists, VideoCut skips subtitle translation and reuses that track. The publish metadata then stays in the original language.
+If no translation endpoint is configured and a Chinese subtitle track exists, VideoCut skips subtitle translation and reuses that track. The publish metadata then stays in the original language.
 
 ### 4. TTS synthesis
 
@@ -59,6 +60,7 @@ Each subtitle segment is synthesized into its own audio file.
 - `CosyVoice` can synthesize Chinese with a reference speaker sample:
   - `cross_lingual`: reference audio only
   - `zero_shot`: reference audio plus reference transcript
+- `command` lets you call an arbitrary local adapter once with a manifest file. The adapter receives the Chinese lines, target output paths, and optional extracted prompt audio so you can wrap any local voice-clone stack you already use.
 
 If no reference audio is provided for `CosyVoice`, VideoCut extracts a prompt clip from the source video automatically.
 If `VIDEOCUT_MINIMAX_VOICE_CLONE=1`, VideoCut also extracts a short prompt clip automatically and caches the cloned voice id under `tts/minimax_voice.json`.
@@ -71,7 +73,8 @@ The dub is not forced to match the original subtitle windows exactly. Instead, V
 - computes a base playback rate needed to fit the whole dub into the video
 - schedules each segment with a minimum inter-segment gap
 - allows a limited lag relative to the next subtitle anchor
-- speeds up only when necessary, up to `VIDEOCUT_MAX_PLAYBACK_RATE`
+- optionally fits each segment closer to the original subtitle window with `VIDEOCUT_TIMING_MODE=fit`
+- keeps playback-rate changes inside `VIDEOCUT_MIN_PLAYBACK_RATE` to `VIDEOCUT_MAX_PLAYBACK_RATE`
 
 This is intentionally a natural-speech-first strategy rather than lip-sync.
 
@@ -82,7 +85,7 @@ If the dub still cannot fit within the configured playback-rate limit, the pipel
 All synthesized segments are delayed onto the planned timeline, time-stretched with `ffmpeg atempo`, mixed into one dubbed track, and combined with the source video.
 
 - If the local `ffmpeg` build supports the `subtitles` filter, subtitles are burned into the video.
-- Otherwise, VideoCut falls back to muxing soft subtitles into the final MP4.
+- Otherwise, VideoCut tries a Pillow + `ffmpeg overlay` hard-subtitle fallback, and only then falls back to muxing soft subtitles into the final MP4.
 - The source thumbnail is copied into a standard publish asset bundle together with `title.txt`, `tags.txt`, `description.txt`, `metadata.json`, and `content_preview.html`.
 
 ## Requirements
@@ -148,12 +151,14 @@ cp .env.example .env
 ### Translation settings
 
 ```env
-VIDEOCUT_LLM_BASE_URL=https://api.openai.com/v1
-VIDEOCUT_LLM_API_KEY=your_api_key
-VIDEOCUT_LLM_MODEL=gpt-4o-mini
+VIDEOCUT_LLM_BASE_URL=http://127.0.0.1:8000/v1
+VIDEOCUT_LLM_API_KEY=
+VIDEOCUT_LLM_MODEL=Qwen3.5-9B-MLX-4bit
 ```
 
-If the source video already has `zh-Hans`, `zh-CN`, or `zh-Hant` subtitles, VideoCut can still complete without an API key by reusing the Chinese track.
+If the source video already has `zh-Hans`, `zh-CN`, or `zh-Hant` subtitles, VideoCut can still complete without any LLM by reusing the Chinese track.
+
+For a hosted provider, keep the same base URL pattern and fill in `VIDEOCUT_LLM_API_KEY`.
 
 ### Default TTS path: CosyVoice
 
@@ -197,11 +202,26 @@ VIDEOCUT_REFERENCE_AUDIO_PATH=/absolute/path/to/reference.wav
 VIDEOCUT_REFERENCE_TEXT=
 ```
 
+### Pluggable external voice-clone path
+
+```env
+VIDEOCUT_TTS_PROVIDER=command
+VIDEOCUT_TTS_COMMAND=python /absolute/path/to/your_tts_adapter.py
+VIDEOCUT_TTS_COMMAND_AUDIO_FORMAT=wav
+VIDEOCUT_REFERENCE_AUDIO_PATH=
+VIDEOCUT_REFERENCE_TEXT=
+```
+
+VideoCut will write `tts/tts_command_inputs.json` and call the adapter with `--input-json /absolute/path/to/tts_command_inputs.json`.
+The manifest contains the Chinese text, source English text, target output path per segment, optional prompt audio path, and optional prompt text.
+
 ### Timing controls
 
 These defaults prioritize natural speech over strict subtitle-window matching:
 
 ```env
+VIDEOCUT_TIMING_MODE=natural
+VIDEOCUT_MIN_PLAYBACK_RATE=0.6
 VIDEOCUT_MAX_PLAYBACK_RATE=1.18
 VIDEOCUT_MAX_SEGMENT_LAG=0.8
 VIDEOCUT_MAX_OPENING_SILENCE=0.35
@@ -211,6 +231,12 @@ VIDEOCUT_TRIM_TTS_SILENCE=1
 VIDEOCUT_TTS_SILENCE_THRESHOLD_DB=-35
 VIDEOCUT_TTS_SILENCE_MIN_DURATION=0.05
 VIDEOCUT_TTS_KEEP_SILENCE=0.02
+```
+
+Optional hard-subtitle fallback font path:
+
+```env
+VIDEOCUT_SUBTITLE_FONT_PATH=/System/Library/Fonts/PingFang.ttc
 ```
 
 ## Usage
@@ -223,6 +249,22 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID"
 
 This now uses `CosyVoice` by default when the local repo and model paths are available.
 YouTube downloads now prefer `1080p`, then `720p`, and only then fall back to lower resolutions.
+
+### Run the requested YouTube Shorts voice-clone workflow
+
+```bash
+videocut run "https://www.youtube.com/shorts/4br1vok5ohk" \
+  --workdir runs/4br1vok5ohk-cosy \
+  --llm-base-url http://127.0.0.1:8000/v1 \
+  --llm-model Qwen3.5-9B-MLX-4bit \
+  --tts-provider cosyvoice \
+  --cosyvoice-mode cross_lingual \
+  --timing-mode fit \
+  --min-playback-rate 0.6 \
+  --max-playback-rate 1.5
+```
+
+This command assumes your local OpenAI-compatible model server is already running and your local `CosyVoice` repo plus weights are configured.
 
 ### Choose a custom work directory
 
@@ -279,6 +321,20 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
   --minimax-voice-clone
 ```
 
+### Plug in Fish Speech / RVC / so-vits-svc through one adapter command
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --llm-base-url http://127.0.0.1:8000/v1 \
+  --llm-model Qwen3.5-9B-MLX-4bit \
+  --tts-provider command \
+  --tts-command "python /absolute/path/to/your_tts_adapter.py" \
+  --tts-command-audio-format wav \
+  --timing-mode fit \
+  --min-playback-rate 0.6 \
+  --max-playback-rate 1.5
+```
+
 ### Export without burning subtitles
 
 ```bash
@@ -294,8 +350,10 @@ Each run creates a working directory under `runs/` or your custom `--workdir`.
 - `tts/`: per-segment synthesized audio files
 - `tts/reference_prompt.wav`: auto-extracted reference audio for `CosyVoice`
 - `tts/cosyvoice_inputs.json`: `CosyVoice` batch input manifest
+- `tts/tts_command_inputs.json`: external command-provider input manifest when `--tts-provider command` is used
 - `audio/dubbed_track.m4a`: mixed Chinese dub track
-- `final_cn.mp4`: final exported video; if ffmpeg lacks the `subtitles` filter, this falls back to a soft-subtitle MP4
+- `final_cn.mp4`: final exported video; if ffmpeg lacks the `subtitles` filter, VideoCut next tries the Pillow overlay burn-in path before falling back to a soft-subtitle MP4
+- `subtitles/burn_overlays/*.png`: generated overlay images when the Pillow hard-subtitle fallback is used
 - `publish/cover.jpg`: copied cover image in a regular image format when available
 - `publish/title.txt`: localized Chinese title
 - `publish/tags.txt`: localized Chinese tags

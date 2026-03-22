@@ -26,7 +26,7 @@ def load_segments_from_vtt(path: Path) -> list[Segment]:
 
 
 def overlay_chinese_from_vtt(segments: list[Segment], path: Path) -> None:
-    chinese_segments = load_segments_from_vtt(path)
+    chinese_segments = load_chinese_segments_from_vtt(path)
     if not chinese_segments:
         raise RuntimeError(f"No usable subtitle segments found in {path}")
 
@@ -43,8 +43,29 @@ def overlay_chinese_from_vtt(segments: list[Segment], path: Path) -> None:
         )
 
 
+def overlay_english_from_vtt(segments: list[Segment], path: Path) -> None:
+    english_segments = load_segments_from_vtt(path)
+    if not english_segments:
+        raise RuntimeError(f"No usable subtitle segments found in {path}")
+
+    matched = 0
+    for segment in segments:
+        translated_text = _find_best_overlap_text(segment.start, segment.end, english_segments)
+        if translated_text:
+            segment.english = translated_text
+            matched += 1
+    if matched == 0:
+        raise RuntimeError(f"English subtitle alignment failed for all segments in {path}")
+
+
 def load_chinese_segments_from_vtt(path: Path) -> list[Segment]:
-    segments = load_segments_from_vtt(path)
+    raw_cues = _parse_vtt_cues(path)
+    collapsed = _collapse_cues(raw_cues)
+    progressive = _strip_progressive_overlap_cjk(collapsed)
+    segments = [
+        Segment(index=index, start=start, end=end, english=text)
+        for index, (start, end, text) in enumerate(progressive, start=1)
+    ]
     for segment in segments:
         segment.chinese = segment.english
         segment.english = ""
@@ -138,6 +159,21 @@ def _strip_progressive_overlap(cues: list[tuple[float, float, str]]) -> list[tup
         if previous_text:
             text = _strip_leading_word_overlap(text, previous_text)
             text = _collapse_immediate_repetition(text)
+        if not text:
+            continue
+        trimmed.append((start, end, text))
+        previous_text = text
+    return trimmed
+
+
+def _strip_progressive_overlap_cjk(cues: list[tuple[float, float, str]]) -> list[tuple[float, float, str]]:
+    trimmed: list[tuple[float, float, str]] = []
+    previous_text = ""
+    for start, end, text in cues:
+        text = _collapse_adjacent_duplicate_tokens(text)
+        if previous_text:
+            text = _strip_leading_text_overlap(text, previous_text)
+            text = _collapse_adjacent_duplicate_tokens(text)
         if not text:
             continue
         trimmed.append((start, end, text))
@@ -273,6 +309,20 @@ def _strip_leading_word_overlap(text: str, previous_text: str, min_words: int = 
     return text
 
 
+def _strip_leading_text_overlap(text: str, previous_text: str, min_chars: int = 4) -> str:
+    stripped = _strip_leading_word_overlap(text, previous_text)
+    if stripped != text:
+        return stripped
+
+    normalized_text = _normalize_compact(text)
+    normalized_previous = _normalize_compact(previous_text)
+    max_overlap = min(len(normalized_text), len(normalized_previous))
+    for overlap in range(max_overlap, min_chars - 1, -1):
+        if normalized_text.startswith(normalized_previous[-overlap:]):
+            return _consume_normalized_prefix(text, overlap).strip()
+    return text
+
+
 def _collapse_immediate_repetition(text: str, min_words: int = 3) -> str:
     words = text.split()
     if len(words) < min_words * 2:
@@ -294,6 +344,18 @@ def _collapse_immediate_repetition(text: str, min_words: int = 3) -> str:
             if changed:
                 break
     return " ".join(words).strip()
+
+
+def _collapse_adjacent_duplicate_tokens(text: str) -> str:
+    tokens = text.split()
+    if not tokens:
+        return ""
+    collapsed = [tokens[0]]
+    for token in tokens[1:]:
+        if _normalize_word(token) == _normalize_word(collapsed[-1]):
+            continue
+        collapsed.append(token)
+    return " ".join(collapsed).strip()
 
 
 def _should_merge_short_cue(
@@ -342,8 +404,22 @@ def _normalize_for_overlap(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
+def _normalize_compact(text: str) -> str:
+    return re.sub(r"\s+", "", text).strip().lower()
+
+
 def _normalize_word(word: str) -> str:
     return re.sub(r"^\W+|\W+$", "", word).lower()
+
+
+def _consume_normalized_prefix(text: str, normalized_length: int) -> str:
+    remaining = normalized_length
+    index = 0
+    while index < len(text) and remaining > 0:
+        if not text[index].isspace():
+            remaining -= 1
+        index += 1
+    return text[index:]
 
 
 def _find_best_overlap_text(start: float, end: float, candidates: list[Segment]) -> str:
@@ -353,7 +429,9 @@ def _find_best_overlap_text(start: float, end: float, candidates: list[Segment])
         if overlap <= 0:
             continue
         if overlap >= min(end - start, candidate.end - candidate.start) * 0.3:
-            overlaps.append(candidate.english)
+            text = candidate.chinese or candidate.english
+            if text:
+                overlaps.append(text)
     if not overlaps:
         return ""
     deduped: list[str] = []

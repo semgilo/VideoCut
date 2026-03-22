@@ -1,0 +1,20 @@
+# One protected term per line.
+# Any term added here will be preserved verbatim during LLM subtitle and metadata translation.
+# Keep the spelling exactly as it appears in the source text.
+
+OpenClaw
+Claude Code
+Claude
+Claude Co-work
+Moritz
+Greg Isenberg
+Greg Eisenberg
+Jensen Wong
+heartbeat.md
+OpenAI
+YouTube
+MLX
+Qwen
+chat GBT
+chatgbt
+cloud code

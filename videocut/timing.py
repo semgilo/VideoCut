@@ -115,6 +115,85 @@ def plan_dubbing_timing(
         previous_end = segment.scheduled_end
 
 
+def plan_dubbing_timing_with_fallback(
+    segments: list[Segment],
+    video_duration: float,
+    timing_mode: str,
+    max_opening_silence: float,
+    max_global_shift: float,
+    min_segment_gap: float,
+    min_playback_rate: float,
+    max_playback_rate: float,
+    max_segment_lag: float,
+) -> tuple[str, float, float]:
+    attempts: list[tuple[str, float, float]] = []
+    seen: set[tuple[str, int, int]] = set()
+
+    def add_attempt(mode: str, rate: float, lag: float) -> None:
+        key = (mode, int(round(rate * 1000)), int(round(lag * 1000)))
+        if key in seen:
+            return
+        seen.add(key)
+        attempts.append((mode, rate, lag))
+
+    add_attempt(timing_mode, max_playback_rate, max_segment_lag)
+    if timing_mode != "fit":
+        add_attempt("fit", max_playback_rate, max_segment_lag)
+
+    candidate_rates = sorted(
+        {
+            max_playback_rate,
+            1.25,
+            1.35,
+            1.5,
+            1.75,
+            2.0,
+            2.25,
+            2.5,
+            3.0,
+        }
+    )
+    candidate_lags = sorted(
+        {
+            max_segment_lag,
+            1.0,
+            1.25,
+            1.5,
+            2.0,
+        }
+    )
+    for mode in (timing_mode, "fit"):
+        for rate in candidate_rates:
+            if rate + 0.001 < max_playback_rate:
+                continue
+            for lag in candidate_lags:
+                if lag + 0.001 < max_segment_lag:
+                    continue
+                add_attempt(mode, rate, lag)
+
+    last_error: RuntimeError | None = None
+    for mode, rate, lag in attempts:
+        try:
+            plan_dubbing_timing(
+                segments=segments,
+                video_duration=video_duration,
+                timing_mode=mode,
+                max_opening_silence=max_opening_silence,
+                max_global_shift=max_global_shift,
+                min_segment_gap=min_segment_gap,
+                min_playback_rate=min_playback_rate,
+                max_playback_rate=rate,
+                max_segment_lag=lag,
+            )
+            return mode, rate, lag
+        except RuntimeError as error:
+            last_error = error
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Dub timing could not be scheduled.")
+
+
 def validate_source_segment_coverage(
     source_segments: list[Segment],
     target_segments: list[Segment],

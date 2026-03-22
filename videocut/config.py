@@ -28,10 +28,43 @@ class PipelineConfig:
     llm_model: str = os.getenv("VIDEOCUT_LLM_MODEL", "gpt-4o-mini")
     llm_timeout: int = int(os.getenv("VIDEOCUT_LLM_TIMEOUT", "120"))
     translation_batch_size: int = int(os.getenv("VIDEOCUT_TRANSLATION_BATCH_SIZE", "25"))
+    translation_concurrency: int = int(os.getenv("VIDEOCUT_TRANSLATION_CONCURRENCY", "1"))
+    translation_timing_adapt: bool = os.getenv("VIDEOCUT_TRANSLATION_TIMING_ADAPT", "0") != "0"
+    translation_target_compact_cps: float = float(
+        os.getenv("VIDEOCUT_TRANSLATION_TARGET_COMPACT_CPS", "4.6")
+    )
+    translation_adapt_slack_chars: int = int(
+        os.getenv("VIDEOCUT_TRANSLATION_ADAPT_SLACK_CHARS", "2")
+    )
+    translation_adapt_passes: int = int(
+        os.getenv("VIDEOCUT_TRANSLATION_ADAPT_PASSES", "2")
+    )
+    translation_adapt_min_chars: int = int(
+        os.getenv("VIDEOCUT_TRANSLATION_ADAPT_MIN_CHARS", "4")
+    )
+    translation_audio_repair: bool = os.getenv("VIDEOCUT_TRANSLATION_AUDIO_REPAIR", "1") != "0"
+    translation_audio_target_playback_rate: float = float(
+        os.getenv("VIDEOCUT_TRANSLATION_AUDIO_TARGET_PLAYBACK_RATE", "1.0")
+    )
+    translation_audio_repair_slack_seconds: float = float(
+        os.getenv("VIDEOCUT_TRANSLATION_AUDIO_REPAIR_SLACK_SECONDS", "0.05")
+    )
+    translation_audio_repair_passes: int = int(
+        os.getenv("VIDEOCUT_TRANSLATION_AUDIO_REPAIR_PASSES", "2")
+    )
+    translation_audio_repair_group_size: int = int(
+        os.getenv("VIDEOCUT_TRANSLATION_AUDIO_REPAIR_GROUP_SIZE", "1")
+    )
+    protected_terms_path: str = os.getenv(
+        "VIDEOCUT_PROTECTED_TERMS_PATH",
+        str(_repo_root() / "translation_protected_terms.txt"),
+    )
 
     tts_provider: str = os.getenv("VIDEOCUT_TTS_PROVIDER", "cosyvoice")
     tts_voice: str = os.getenv("VIDEOCUT_TTS_VOICE", "zh-CN-XiaoxiaoNeural")
     tts_rate: str = os.getenv("VIDEOCUT_TTS_RATE", "+0%")
+    tts_command: str = os.getenv("VIDEOCUT_TTS_COMMAND", "")
+    tts_command_audio_format: str = os.getenv("VIDEOCUT_TTS_COMMAND_AUDIO_FORMAT", "wav")
     minimax_base_url: str = os.getenv("VIDEOCUT_MINIMAX_BASE_URL", "https://api.minimax.io")
     minimax_api_key: str = os.getenv("VIDEOCUT_MINIMAX_API_KEY", "")
     minimax_model: str = os.getenv("VIDEOCUT_MINIMAX_MODEL", "speech-2.8-turbo")
@@ -59,6 +92,8 @@ class PipelineConfig:
 
     dub_audio_volume: float = float(os.getenv("VIDEOCUT_DUB_AUDIO_VOLUME", "1.0"))
     original_audio_volume: float = float(os.getenv("VIDEOCUT_ORIGINAL_AUDIO_VOLUME", "0.0"))
+    timing_mode: str = os.getenv("VIDEOCUT_TIMING_MODE", "natural")
+    min_playback_rate: float = float(os.getenv("VIDEOCUT_MIN_PLAYBACK_RATE", "0.6"))
     max_playback_rate: float = float(os.getenv("VIDEOCUT_MAX_PLAYBACK_RATE", "1.18"))
     max_segment_lag: float = float(os.getenv("VIDEOCUT_MAX_SEGMENT_LAG", "0.8"))
     min_segment_gap: float = float(os.getenv("VIDEOCUT_MIN_SEGMENT_GAP", "0.05"))
@@ -71,7 +106,11 @@ class PipelineConfig:
 
     burn_subtitles: bool = os.getenv("VIDEOCUT_BURN_SUBTITLES", "1") != "0"
     subtitle_font: str = os.getenv("VIDEOCUT_SUBTITLE_FONT", "Arial Unicode MS")
+    subtitle_font_path: str = os.getenv("VIDEOCUT_SUBTITLE_FONT_PATH", "")
     subtitle_font_size: int = int(os.getenv("VIDEOCUT_SUBTITLE_FONT_SIZE", "18"))
+    subtitle_overlay_concurrency: int = int(os.getenv("VIDEOCUT_SUBTITLE_OVERLAY_CONCURRENCY", "4"))
+    video_preset: str = os.getenv("VIDEOCUT_VIDEO_PRESET", "medium")
+    video_crf: int = int(os.getenv("VIDEOCUT_VIDEO_CRF", "20"))
 
     asr_model: str = os.getenv("VIDEOCUT_ASR_MODEL", "small")
     asr_device: str = os.getenv("VIDEOCUT_ASR_DEVICE", "auto")

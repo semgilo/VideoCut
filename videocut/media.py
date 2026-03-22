@@ -2,14 +2,29 @@ from __future__ import annotations
 
 import json
 import subprocess
+import wave
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 from videocut.models import Segment, VideoMetadata
 from videocut.publish import metadata_to_dict
-from videocut.shell import run_command
+from videocut.shell import resolve_tool_binary, run_command
 
 
 def ffprobe_duration(path: Path) -> float:
+    if path.suffix.lower() == ".wav":
+        try:
+            with wave.open(str(path), "rb") as wav_file:
+                frame_rate = wav_file.getframerate()
+                frame_count = wav_file.getnframes()
+                if frame_rate <= 0:
+                    raise RuntimeError(f"Invalid WAV frame rate for {path}")
+                return frame_count / frame_rate
+        except (wave.Error, EOFError):
+            # CosyVoice may emit float PCM WAVs that Python's wave module
+            # does not decode; fall back to ffprobe for those files.
+            pass
     output = run_command(
         [
             "ffprobe",
@@ -25,6 +40,35 @@ def ffprobe_duration(path: Path) -> float:
         log_command=False,
     )
     return float(output)
+
+
+def ffprobe_video_size(path: Path) -> tuple[int, int]:
+    output = run_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        log_command=False,
+    )
+    payload = json.loads(output)
+    streams = payload.get("streams") or []
+    if not streams:
+        raise RuntimeError(f"Could not determine video size for {path}")
+    stream = streams[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Invalid video size reported for {path}: {payload}")
+    return width, height
 
 
 def finalize_synthesized_segments(
@@ -53,6 +97,10 @@ def finalize_synthesized_segments(
                 total_leading_trim += leading_trim
                 total_trailing_trim += trailing_trim
         segment.synthetic_duration = ffprobe_duration(segment.audio_path)
+        if not trim_silence:
+            segment.leading_silence = 0.0
+            segment.trailing_silence = 0.0
+            continue
         segment.leading_silence, segment.trailing_silence = detect_audio_edge_silence(
             path=segment.audio_path,
             silence_threshold_db=silence_threshold_db,
@@ -97,7 +145,7 @@ def trim_audio_silence_in_place(
             "areverse"
         )
         cmd = [
-            "ffmpeg",
+            resolve_tool_binary("ffmpeg"),
             "-y",
             "-loglevel",
             "error",
@@ -110,7 +158,11 @@ def trim_audio_silence_in_place(
         ]
         subprocess.run(cmd, check=True, text=True, capture_output=True)
 
-        trimmed_duration = ffprobe_duration(output_path)
+        try:
+            trimmed_duration = ffprobe_duration(output_path)
+        except (ValueError, subprocess.CalledProcessError):
+            output_path.unlink(missing_ok=True)
+            break
         if trimmed_duration < 0.01:
             output_path.unlink(missing_ok=True)
             break
@@ -130,7 +182,7 @@ def detect_audio_edge_silence(
     duration = ffprobe_duration(path)
     completed = subprocess.run(
         [
-            "ffmpeg",
+            resolve_tool_binary("ffmpeg"),
             "-hide_banner",
             "-i",
             str(path),
@@ -249,9 +301,14 @@ def render_final_video(
     output_path: Path,
     burn_subtitles: bool,
     subtitle_font: str,
+    subtitle_font_path: str,
     subtitle_font_size: int,
+    video_preset: str = "medium",
+    video_crf: int = 20,
+    subtitle_overlay_concurrency: int = 1,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    video_codec_args = _build_video_codec_args(video_preset=video_preset, video_crf=video_crf)
     if burn_subtitles and _ffmpeg_has_subtitles_filter():
         subtitle_filter = (
             f"subtitles=filename='{_escape_filter_path(subtitle_path.resolve())}':"
@@ -266,25 +323,53 @@ def render_final_video(
             str(video_path),
             "-i",
             str(dubbed_track_path),
+            "-i",
+            str(subtitle_path),
             "-vf",
             subtitle_filter,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
+            *video_codec_args,
             "-map",
             "0:v:0",
             "-map",
             "1:a:0",
+            "-map",
+            "2:0",
             "-c:a",
             "aac",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:s:0",
+            "language=zho",
+            "-metadata:s:s:0",
+            "title=Chinese",
+            "-disposition:s:0",
+            "default",
             "-shortest",
             str(output_path),
         ]
         run_command(cmd)
         return output_path
+
+    if burn_subtitles:
+        try:
+            return _render_final_video_with_overlay_subtitles(
+                video_path=video_path,
+                dubbed_track_path=dubbed_track_path,
+                subtitle_path=subtitle_path,
+                output_path=output_path,
+                subtitle_font_path=subtitle_font_path,
+                subtitle_font_size=subtitle_font_size,
+                video_preset=video_preset,
+                video_crf=video_crf,
+                subtitle_overlay_concurrency=subtitle_overlay_concurrency,
+            )
+        except ImportError:
+            print(
+                "Warning: ffmpeg subtitles filter is unavailable and Pillow is not installed. "
+                "Falling back to soft subtitles."
+            )
+        except Exception as error:
+            print(f"Warning: hard-subtitle overlay fallback failed, falling back to soft subtitles: {error}")
 
     if burn_subtitles:
         print("Warning: ffmpeg subtitles filter is unavailable. Falling back to soft subtitles.")
@@ -315,6 +400,130 @@ def render_final_video(
             "mov_text",
             "-metadata:s:s:0",
             "language=zho",
+            "-metadata:s:s:0",
+            "title=Chinese",
+            "-disposition:s:0",
+            "default",
+            "-shortest",
+            str(output_path),
+        ]
+    )
+    run_command(cmd)
+    return output_path
+
+
+@dataclass(slots=True)
+class SubtitleCue:
+    start: float
+    end: float
+    text: str
+    image_path: Path
+
+
+def _render_final_video_with_overlay_subtitles(
+    video_path: Path,
+    dubbed_track_path: Path,
+    subtitle_path: Path,
+    output_path: Path,
+    subtitle_font_path: str,
+    subtitle_font_size: int,
+    video_preset: str,
+    video_crf: int,
+    subtitle_overlay_concurrency: int,
+) -> Path:
+    cues = _load_srt_cues(subtitle_path)
+    if not cues:
+        raise RuntimeError(f"No subtitle cues were found in {subtitle_path}")
+
+    width, height = ffprobe_video_size(video_path)
+    overlay_dir = subtitle_path.parent / "burn_overlays"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    font_path = _resolve_subtitle_font_path(subtitle_font_path)
+    video_duration = ffprobe_duration(video_path)
+
+    pending_cues: list[SubtitleCue] = []
+    for index, cue in enumerate(cues, start=1):
+        cue.image_path = overlay_dir / f"{index:04d}.png"
+        if cue.image_path.exists() and cue.image_path.stat().st_size > 0:
+            continue
+        pending_cues.append(cue)
+
+    if pending_cues:
+        max_workers = max(1, min(subtitle_overlay_concurrency, len(pending_cues)))
+        if max_workers == 1:
+            for cue in pending_cues:
+                _render_subtitle_overlay_image(
+                    output_path=cue.image_path,
+                    width=width,
+                    height=height,
+                    text=cue.text,
+                    font_path=font_path,
+                    subtitle_font_size=subtitle_font_size,
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _render_subtitle_overlay_image,
+                        output_path=cue.image_path,
+                        width=width,
+                        height=height,
+                        text=cue.text,
+                        font_path=font_path,
+                        subtitle_font_size=subtitle_font_size,
+                    )
+                    for cue in pending_cues
+                ]
+                for future in futures:
+                    future.result()
+
+    cmd = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(dubbed_track_path)]
+    filters: list[str] = []
+    current_label = "0:v"
+    for input_index, cue in enumerate(cues, start=2):
+        cmd.extend(
+            [
+                "-loop",
+                "1",
+                "-t",
+                f"{video_duration:.3f}",
+                "-i",
+                str(cue.image_path),
+            ]
+        )
+        next_label = f"v{input_index - 1}"
+        filters.append(
+            f"[{current_label}][{input_index}:v]"
+            f"overlay=0:0:enable='between(t,{cue.start:.3f},{cue.end:.3f})'"
+            f"[{next_label}]"
+        )
+        current_label = next_label
+
+    cmd.extend(["-i", str(subtitle_path)])
+    subtitle_input_index = len(cues) + 2
+    cmd.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            f"[{current_label}]",
+            "-map",
+            "1:a:0",
+            "-map",
+            f"{subtitle_input_index}:0",
+            *_build_video_codec_args(video_preset=video_preset, video_crf=video_crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:s:0",
+            "language=zho",
+            "-metadata:s:s:0",
+            "title=Chinese",
+            "-disposition:s:0",
+            "default",
             "-shortest",
             str(output_path),
         ]
@@ -394,6 +603,17 @@ def _audio_codec_args_for_path(path: Path) -> list[str]:
     return []
 
 
+def _build_video_codec_args(video_preset: str, video_crf: int) -> list[str]:
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        video_preset,
+        "-crf",
+        str(video_crf),
+    ]
+
+
 def _escape_filter_path(path: Path) -> str:
     value = str(path)
     value = value.replace("\\", "\\\\")
@@ -412,3 +632,109 @@ def _ffmpeg_has_subtitles_filter() -> bool:
         log_command=False,
     )
     return " subtitles " in output or "\n... subtitles" in output
+
+
+def _load_srt_cues(path: Path) -> list[SubtitleCue]:
+    cues: list[SubtitleCue] = []
+    raw_blocks = path.read_text(encoding="utf-8", errors="ignore").strip().split("\n\n")
+    for block in raw_blocks:
+        lines = [line.strip("\ufeff") for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        timestamp_line_index = next((index for index, line in enumerate(lines) if "-->" in line), -1)
+        if timestamp_line_index < 0:
+            continue
+        timestamp_line = lines[timestamp_line_index]
+        try:
+            start_raw, end_raw = [part.strip() for part in timestamp_line.split("-->", 1)]
+            start = _parse_srt_timestamp(start_raw)
+            end = _parse_srt_timestamp(end_raw)
+        except ValueError:
+            continue
+        text = "\n".join(lines[timestamp_line_index + 1 :]).strip()
+        if not text:
+            continue
+        cues.append(SubtitleCue(start=start, end=end, text=text, image_path=Path()))
+    return cues
+
+
+def _parse_srt_timestamp(value: str) -> float:
+    hours, minutes, seconds = value.replace(",", ".").split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _render_subtitle_overlay_image(
+    output_path: Path,
+    width: int,
+    height: int,
+    text: str,
+    font_path: Path,
+    subtitle_font_size: int,
+) -> None:
+    from PIL import Image, ImageDraw, ImageFont
+
+    resolved_font_size = max(subtitle_font_size, int(height * 0.035))
+    font = ImageFont.truetype(str(font_path), size=resolved_font_size)
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    spacing = max(6, resolved_font_size // 5)
+    stroke_width = max(2, resolved_font_size // 14)
+    text_bbox = draw.multiline_textbbox(
+        (0, 0),
+        text,
+        font=font,
+        align="center",
+        spacing=spacing,
+        stroke_width=stroke_width,
+    )
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+    padding_x = max(24, resolved_font_size // 2)
+    padding_y = max(14, resolved_font_size // 4)
+    x = (width - text_width) / 2
+    y = height - int(height * 0.09) - text_height
+    box = (
+        int(max(0, x - padding_x)),
+        int(max(0, y - padding_y)),
+        int(min(width, x + text_width + padding_x)),
+        int(min(height, y + text_height + padding_y)),
+    )
+    draw.rounded_rectangle(box, radius=max(12, resolved_font_size // 3), fill=(0, 0, 0, 156))
+    draw.multiline_text(
+        (x, y),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+        align="center",
+        spacing=spacing,
+        stroke_width=stroke_width,
+        stroke_fill=(0, 0, 0, 255),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+
+
+def _resolve_subtitle_font_path(subtitle_font_path: str) -> Path:
+    if subtitle_font_path.strip():
+        path = Path(subtitle_font_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Subtitle font file not found: {path}")
+        return path
+
+    candidates = [
+        Path("/System/Library/Fonts/PingFang.ttc"),
+        Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+        Path("/System/Library/Fonts/STHeiti Light.ttc"),
+        Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        Path("/Library/Fonts/Arial Unicode.ttf"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise RuntimeError(
+        "No subtitle font file could be auto-detected for the Pillow overlay fallback. "
+        "Set VIDEOCUT_SUBTITLE_FONT_PATH or pass --subtitle-font-path."
+    )
