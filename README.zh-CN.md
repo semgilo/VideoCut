@@ -147,6 +147,20 @@ pip install -r .vendor/CosyVoice/requirements.txt
 cp .env.example .env
 ```
 
+如果你想把整个流程都收敛到一个配置文件，直接再复制一份 TOML 模板：
+
+```bash
+cp videocut.example.toml videocut.toml
+```
+
+之后默认直接执行：
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+CLI 会自动读取当前目录里的 `videocut.toml`；命令行参数优先级高于配置文件。
+
 ### 翻译接口
 
 ```env
@@ -158,6 +172,22 @@ VIDEOCUT_LLM_MODEL=Qwen3.5-9B-MLX-4bit
 如果源视频本身已经带有 `zh-Hans`、`zh-CN` 或 `zh-Hant` 字幕，即使完全不配置 LLM，也可以直接复用中文字幕跑完整条流程。
 
 如果你用的是远程服务，保持同样的 OpenAI 兼容格式，再补上 `VIDEOCUT_LLM_API_KEY` 即可。
+
+### 本地模型并行翻译建议
+
+如果你要让本地模型并行处理整条字幕，优先使用支持 `/v1/chat/completions` 的聊天模型，例如：
+
+```env
+VIDEOCUT_LLM_BASE_URL=http://127.0.0.1:8888/v1
+VIDEOCUT_LLM_API_KEY=your_local_api_key
+VIDEOCUT_LLM_MODEL=Qwen3.5-9B-MLX-4bit
+VIDEOCUT_TRANSLATION_BATCH_SIZE=25
+VIDEOCUT_TRANSLATION_CONCURRENCY=4
+```
+
+建议从 `VIDEOCUT_TRANSLATION_CONCURRENCY=2` 或 `4` 开始压测，再按本机内存和服务稳定性上调。
+
+不建议把 `translategemma-*` 当成“本地高吞吐并行”的默认模型。当前代码会把名字以 `translategemma` 开头的模型识别为 completion 模型，并改走 `/v1/completions` 的逐句翻译路径；虽然也能开并发，但请求数会明显更多，长视频时稳定性和吞吐通常不如批量 JSON 的 chat 模型。
 
 ### 默认 TTS 路径：CosyVoice
 
@@ -265,6 +295,62 @@ videocut run "https://www.youtube.com/shorts/4br1vok5ohk" \
 
 这个命令默认你已经把本地 OpenAI 兼容模型服务启动好了，并且 `CosyVoice` 仓库和模型权重路径都已配置完成。
 
+### 只做字幕翻译，不配音，不做声音克隆
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --mode subtitle_only \
+  --config videocut.toml
+```
+
+建议在 `videocut.toml` 里这样配置：
+
+```toml
+[pipeline]
+mode = "subtitle_only"
+translation_backend = "llm"
+export_platform_materials = true
+output_name = "final_subtitled.mp4"
+
+[translation]
+llm_base_url = "http://127.0.0.1:8888/v1"
+llm_api_key = "your_local_api_key"
+llm_model = "Qwen3.5-9B-MLX-4bit"
+batch_size = 25
+concurrency = 4
+```
+
+如果本地模型暂时不稳定，但你仍然需要先把字幕版和平台材料跑出来，可以在配置文件里把后端切成：
+
+```toml
+[pipeline]
+translation_backend = "google"
+```
+
+### 给 AI 代理的调用约定
+
+如果用户明确说的是下面这类需求：
+
+- “只要字幕翻译”
+- “不要配音”
+- “不要声音克隆”
+- “给我抖音 / Bilibili / 小红书材料，但不要导出多份视频”
+
+优先调用：
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --mode subtitle_only \
+  --config videocut.toml
+```
+
+同时遵循下面的调用规则：
+
+1. 如果用户要求“本地模型并行处理”，优先把 `VIDEOCUT_LLM_MODEL` 设成 `Qwen3.5-9B-MLX-4bit` 这类 chat 模型，并显式设置 `VIDEOCUT_TRANSLATION_CONCURRENCY=2` 或 `4`。
+2. 字幕-only需求也统一走 `videocut run`，只通过 `--mode subtitle_only` 和配置文件切换流程，不再依赖单独脚本作为主入口。
+3. 如果本地 LLM 端点不可达或不稳定，再把配置文件里的 `translation_backend` 改成 `google`，但仍然使用同一个 CLI 和同一套输出结构。
+4. 输出目录默认是 `runs/<video_id>-subtitle-only-<date>/`。
+
 ### 指定工作目录
 
 ```bash
@@ -346,6 +432,7 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID" --no-burn-subtitles
 
 - `source/`：下载的视频、字幕、缩略图、原始元数据和抽取的音频
 - `subtitles/zh.srt`：生成的中文字幕
+- `final_subtitled.mp4`：仅加中文字幕、保留原声的最终成片
 - `tts/`：逐句配音片段
 - `tts/reference_prompt.wav`：自动抽取的 `CosyVoice` 参考音频
 - `tts/cosyvoice_inputs.json`：`CosyVoice` 批量推理输入清单
@@ -359,6 +446,10 @@ videocut run "https://www.youtube.com/watch?v=VIDEO_ID" --no-burn-subtitles
 - `publish/description.txt`：中文版简介
 - `publish/metadata.json`：结构化保存的原始/中文元数据
 - `publish/content_preview.html`：本地内容预览页
+- `platforms/<platform>/cover.jpg`：按平台建议尺寸生成的封面图
+- `platforms/<platform>/cover_source.jpg`：封面源图备份
+- `platforms/<platform>/requirements.md`：该平台的公开上传要求与适配判断
+- `platforms/<platform>/title.txt` / `description.txt` / `hashtags.txt`：平台文案材料
 - `manifest.json`：完整任务清单，可用于复查或二次渲染
 
 ## 辅助脚本

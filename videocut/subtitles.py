@@ -72,11 +72,17 @@ def load_chinese_segments_from_vtt(path: Path) -> list[Segment]:
     return segments
 
 
-def write_srt(path: Path, segments: list[Segment]) -> None:
+def write_srt(path: Path, segments: list[Segment], bilingual: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     for index, segment in enumerate(segments, start=1):
-        subtitle_text = _wrap_text(segment.chinese or segment.english)
+        # 支持双语字幕：先中文，后英文
+        if bilingual and segment.chinese and segment.english:
+            chinese_text = _wrap_text(segment.chinese)
+            english_text = segment.english.strip()
+            subtitle_text = f"{chinese_text}\n{english_text}"
+        else:
+            subtitle_text = _wrap_text(segment.chinese or segment.english)
         lines.extend(
             [
                 str(index),

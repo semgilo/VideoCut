@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Iterable
@@ -16,8 +17,6 @@ from videocut.models import Segment, VideoMetadata
 JSON_RE = re.compile(r"\{.*\}", re.S)
 PROTECTED_PLACEHOLDER_TEMPLATE = "[[VC_TERM_{index:04d}]]"
 PLACEHOLDER_VARIANT_RE = re.compile(r"\[\[?VC_TERM_(?P<id>\d{1,4}|xxxx)\]?\]?", re.IGNORECASE)
-COMPACT_TEXT_DROP_RE = re.compile(r"[\s，。！？、,.!?;:：；…“”\"'()（）\\[\\]{}<>《》—-]+")
-
 
 class OpenAICompatibleTranslator:
     def __init__(
@@ -56,141 +55,17 @@ class OpenAICompatibleTranslator:
                 translated_count += future.result()
                 print(f"Translated {translated_count}/{total_segments} segments")
 
-    def adapt_subtitles_for_timing(
-        self,
-        segments: list[Segment],
-        target_compact_cps: float,
-        slack_chars: int,
-        passes: int,
-        min_compact_chars: int,
-    ) -> int:
-        total_adapted = 0
-        for _ in range(max(1, passes)):
-            candidates = [
-                segment
-                for segment in segments
-                if _needs_timing_adaptation(
-                    segment=segment,
-                    target_compact_cps=target_compact_cps,
-                    slack_chars=slack_chars,
-                    min_compact_chars=min_compact_chars,
-                )
-            ]
-            if not candidates:
-                break
-            adapted_count = self._adapt_subtitle_candidate_pass(
-                candidates=candidates,
-                target_compact_cps=target_compact_cps,
-                slack_chars=slack_chars,
-                min_compact_chars=min_compact_chars,
-            )
-            total_adapted += adapted_count
-            if adapted_count == 0:
-                break
-        return total_adapted
-
-    def adapt_subtitles_for_audio_timing(
-        self,
-        candidates: list[Segment],
-        target_playback_rate: float,
-        slack_seconds: float,
-        min_compact_chars: int,
-    ) -> list[Segment]:
-        if not candidates:
-            return []
-        if _requires_completion_api(self.model):
-            return self._adapt_audio_timing_with_completion_model(
-                candidates=candidates,
-                target_playback_rate=target_playback_rate,
-                slack_seconds=slack_seconds,
-                min_compact_chars=min_compact_chars,
-            )
-
-        term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
-        if self.concurrency <= 1 or len(candidates) <= 1:
-            adapted_segments: list[Segment] = []
-            for segment in candidates:
-                if self._adapt_chat_segment_for_audio_timing(
-                    segment=segment,
-                    target_playback_rate=target_playback_rate,
-                    slack_seconds=slack_seconds,
-                    min_compact_chars=min_compact_chars,
-                    term_to_placeholder=term_to_placeholder,
-                    placeholder_to_term=placeholder_to_term,
-                ):
-                    adapted_segments.append(segment)
-            return adapted_segments
-
-        adapted_segments: list[Segment] = []
-        with ThreadPoolExecutor(max_workers=min(self.concurrency, len(candidates))) as executor:
-            futures = {
-                executor.submit(
-                    self._adapt_chat_segment_for_audio_timing,
-                    segment=segment,
-                    target_playback_rate=target_playback_rate,
-                    slack_seconds=slack_seconds,
-                    min_compact_chars=min_compact_chars,
-                    term_to_placeholder=term_to_placeholder,
-                    placeholder_to_term=placeholder_to_term,
-                ): segment
-                for segment in candidates
-            }
-            for future in as_completed(futures):
-                if future.result():
-                    adapted_segments.append(futures[future])
-        return adapted_segments
-
-    def _adapt_subtitle_candidate_pass(
-        self,
-        candidates: list[Segment],
-        target_compact_cps: float,
-        slack_chars: int,
-        min_compact_chars: int,
-    ) -> int:
-        if _requires_completion_api(self.model):
-            return self._adapt_subtitles_with_completion_model(
-                candidates=candidates,
-                target_compact_cps=target_compact_cps,
-                slack_chars=slack_chars,
-                min_compact_chars=min_compact_chars,
-            )
-
-        term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
-        if self.concurrency <= 1 or len(candidates) <= 1:
-            adapted_count = 0
-            for segment in candidates:
-                adapted_count += int(
-                    self._adapt_chat_segment_for_timing(
-                        segment=segment,
-                        target_compact_cps=target_compact_cps,
-                        slack_chars=slack_chars,
-                        min_compact_chars=min_compact_chars,
-                        term_to_placeholder=term_to_placeholder,
-                        placeholder_to_term=placeholder_to_term,
-                    )
-                )
-            return adapted_count
-
-        adapted_count = 0
-        with ThreadPoolExecutor(max_workers=min(self.concurrency, len(candidates))) as executor:
-            futures = [
-                executor.submit(
-                    self._adapt_chat_segment_for_timing,
-                    segment=segment,
-                    target_compact_cps=target_compact_cps,
-                    slack_chars=slack_chars,
-                    min_compact_chars=min_compact_chars,
-                    term_to_placeholder=term_to_placeholder,
-                    placeholder_to_term=placeholder_to_term,
-                )
-                for segment in candidates
-            ]
-            for future in as_completed(futures):
-                adapted_count += int(future.result())
-        return adapted_count
 
     def _translate_batch(self, batch: list[Segment]) -> list[dict[str, str | int]]:
-        payload_segments = [{"id": segment.index, "text": segment.english} for segment in batch]
+        payload_segments = [
+            {
+                "id": segment.index,
+                "text": segment.english,
+                "duration": round(segment.duration, 2),
+                "budget": max(4, int(segment.duration * 4.5)),
+            }
+            for segment in batch
+        ]
         masked_segments, required_placeholders, placeholder_to_term = _mask_segment_payload(
             payload_segments,
             self.protected_terms,
@@ -199,6 +74,10 @@ class OpenAICompatibleTranslator:
             "You are a subtitle translator for dubbing. Translate English subtitles into concise, "
             "spoken Simplified Chinese that sounds natural aloud. Prefer shorter phrasing over literal "
             "translation when the meaning stays intact. Keep names, product terms, and numbers accurate. "
+            "Each subtitle has a 'duration' field (seconds) and 'budget' field (max Chinese characters). "
+            "The translation MUST fit within the duration: aim for AT MOST 'budget' Chinese characters "
+            "(excluding spaces and punctuation). Natural Chinese speech is ~4.5 characters/second. "
+            "If the source text is too long, use concise paraphrasing to stay within budget. "
             "If placeholder tokens like [[VC_TERM_0001]] appear, copy them exactly and do not translate, "
             "remove, or rename them. "
             "Avoid adding filler words or explanations that were not in the source. "
@@ -206,6 +85,7 @@ class OpenAICompatibleTranslator:
         )
         user_prompt = (
             "Translate each subtitle item to Simplified Chinese. Preserve the ids exactly. "
+            "Respect the duration and budget constraints for each item. "
             "If any [[VC_TERM_xxxx]] token appears, keep it unchanged in the output.\n"
             f"{json.dumps(masked_segments, ensure_ascii=False)}"
         )
@@ -272,7 +152,6 @@ class OpenAICompatibleTranslator:
             webpage_url=metadata.webpage_url,
             upload_date=metadata.upload_date,
         )
-
     def _translate_with_completion_model(self, segments: list[Segment]) -> None:
         term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
         total_segments = len(segments)
@@ -281,7 +160,7 @@ class OpenAICompatibleTranslator:
                 segment.chinese = _translate_completion_text(
                     translator=self,
                     text=segment.english,
-                    prompt_builder=_subtitle_completion_prompt,
+                    prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(t, p, s, d),
                     term_to_placeholder=term_to_placeholder,
                     placeholder_to_term=placeholder_to_term,
                     max_tokens=_completion_max_tokens(segment.english, minimum=96, maximum=220),
@@ -295,7 +174,7 @@ class OpenAICompatibleTranslator:
                     _translate_completion_text,
                     translator=self,
                     text=segment.english,
-                    prompt_builder=_subtitle_completion_prompt,
+                    prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(t, p, s, d),
                     term_to_placeholder=term_to_placeholder,
                     placeholder_to_term=placeholder_to_term,
                     max_tokens=_completion_max_tokens(segment.english, minimum=96, maximum=220),
@@ -309,213 +188,6 @@ class OpenAICompatibleTranslator:
                 segment.chinese = future.result()
                 translated_count += 1
                 print(f"Translated {translated_count}/{total_segments} segments")
-
-    def _adapt_subtitles_with_completion_model(
-        self,
-        candidates: list[Segment],
-        target_compact_cps: float,
-        slack_chars: int,
-        min_compact_chars: int,
-    ) -> int:
-        term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
-        if self.concurrency <= 1 or len(candidates) <= 1:
-            adapted_count = 0
-            for segment in candidates:
-                adapted_count += int(
-                    _adapt_completion_segment(
-                        translator=self,
-                        segment=segment,
-                        target_compact_cps=target_compact_cps,
-                        slack_chars=slack_chars,
-                        min_compact_chars=min_compact_chars,
-                        term_to_placeholder=term_to_placeholder,
-                        placeholder_to_term=placeholder_to_term,
-                    )
-                )
-            return adapted_count
-
-        adapted_count = 0
-        with ThreadPoolExecutor(max_workers=min(self.concurrency, len(candidates))) as executor:
-            futures = [
-                executor.submit(
-                    _adapt_completion_segment,
-                    translator=self,
-                    segment=segment,
-                    target_compact_cps=target_compact_cps,
-                    slack_chars=slack_chars,
-                    min_compact_chars=min_compact_chars,
-                    term_to_placeholder=term_to_placeholder,
-                    placeholder_to_term=placeholder_to_term,
-                )
-                for segment in candidates
-            ]
-            for future in as_completed(futures):
-                adapted_count += int(future.result())
-        return adapted_count
-
-    def _adapt_audio_timing_with_completion_model(
-        self,
-        candidates: list[Segment],
-        target_playback_rate: float,
-        slack_seconds: float,
-        min_compact_chars: int,
-    ) -> list[Segment]:
-        term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
-        if self.concurrency <= 1 or len(candidates) <= 1:
-            adapted_segments: list[Segment] = []
-            for segment in candidates:
-                if _adapt_completion_segment_for_audio_timing(
-                    translator=self,
-                    segment=segment,
-                    target_playback_rate=target_playback_rate,
-                    slack_seconds=slack_seconds,
-                    min_compact_chars=min_compact_chars,
-                    term_to_placeholder=term_to_placeholder,
-                    placeholder_to_term=placeholder_to_term,
-                ):
-                    adapted_segments.append(segment)
-            return adapted_segments
-
-        adapted_segments: list[Segment] = []
-        with ThreadPoolExecutor(max_workers=min(self.concurrency, len(candidates))) as executor:
-            futures = {
-                executor.submit(
-                    _adapt_completion_segment_for_audio_timing,
-                    translator=self,
-                    segment=segment,
-                    target_playback_rate=target_playback_rate,
-                    slack_seconds=slack_seconds,
-                    min_compact_chars=min_compact_chars,
-                    term_to_placeholder=term_to_placeholder,
-                    placeholder_to_term=placeholder_to_term,
-                ): segment
-                for segment in candidates
-            }
-            for future in as_completed(futures):
-                if future.result():
-                    adapted_segments.append(futures[future])
-        return adapted_segments
-
-    def _adapt_chat_segment_for_timing(
-        self,
-        segment: Segment,
-        target_compact_cps: float,
-        slack_chars: int,
-        min_compact_chars: int,
-        term_to_placeholder: dict[str, str],
-        placeholder_to_term: dict[str, str],
-    ) -> bool:
-        target_compact_chars = _target_compact_chars(
-            duration=segment.duration,
-            target_compact_cps=target_compact_cps,
-            min_compact_chars=min_compact_chars,
-        )
-        current_text = segment.chinese.strip()
-        current_compact_chars = _compact_text_length(current_text)
-        masked_english, english_placeholders = _mask_text(segment.english, term_to_placeholder)
-        masked_chinese, chinese_placeholders = _mask_text(current_text, term_to_placeholder)
-        required_placeholders = _dedupe_strings([*english_placeholders, *chinese_placeholders])
-
-        for strict in (False, True):
-            system_prompt = (
-                "You adapt translated dubbing subtitles to fit a strict time window. "
-                "Rewrite the Chinese line into shorter, natural spoken Simplified Chinese while keeping "
-                "the English meaning intact. Preserve names, product terms, filenames, numbers, and any "
-                "VC_TERM placeholders exactly. Remove filler and redundant wording. "
-                'Return JSON only with this shape: {"text":"..."}.' 
-            )
-            user_prompt = (
-                "Shorten this translated dubbing line.\n"
-                f"Duration seconds: {segment.duration:.2f}\n"
-                f"Target compact characters (excluding spaces and punctuation): <= {target_compact_chars}\n"
-                f"Current compact characters: {current_compact_chars}\n"
-                f"{_adaptation_placeholder_instruction(required_placeholders, strict)}\n"
-                f"English source: {masked_english}\n"
-                f"Current Chinese: {masked_chinese}"
-            )
-            parsed = self._complete_json(system_prompt, user_prompt)
-            candidate = str(parsed.get("text") or "").strip()
-            if not candidate:
-                continue
-            try:
-                restored = _restore_masked_text(candidate, required_placeholders, placeholder_to_term)
-            except RuntimeError:
-                continue
-            if _should_accept_timing_adaptation(
-                original_text=current_text,
-                candidate_text=restored,
-                target_compact_chars=target_compact_chars,
-                slack_chars=slack_chars,
-            ):
-                segment.chinese = restored
-                return True
-        return False
-
-    def _adapt_chat_segment_for_audio_timing(
-        self,
-        segment: Segment,
-        target_playback_rate: float,
-        slack_seconds: float,
-        min_compact_chars: int,
-        term_to_placeholder: dict[str, str],
-        placeholder_to_term: dict[str, str],
-    ) -> bool:
-        current_text = segment.chinese.strip()
-        current_audio_duration = max(0.01, segment.synthetic_duration or segment.duration)
-        target_audio_duration = _target_audio_duration(
-            duration=segment.duration,
-            target_playback_rate=target_playback_rate,
-            slack_seconds=slack_seconds,
-        )
-        target_compact_chars = _target_audio_compact_chars(
-            current_text=current_text,
-            current_audio_duration=current_audio_duration,
-            target_audio_duration=target_audio_duration,
-            min_compact_chars=min_compact_chars,
-        )
-        current_compact_chars = _compact_text_length(current_text)
-        masked_english, english_placeholders = _mask_text(segment.english, term_to_placeholder)
-        masked_chinese, chinese_placeholders = _mask_text(current_text, term_to_placeholder)
-        required_placeholders = _dedupe_strings([*english_placeholders, *chinese_placeholders])
-
-        for strict in (False, True):
-            system_prompt = (
-                "You repair translated dubbing subtitles that ran too long after TTS synthesis. "
-                "Rewrite the Chinese line into shorter, natural spoken Simplified Chinese while keeping "
-                "the English meaning intact. Preserve names, product terms, filenames, numbers, and any "
-                "VC_TERM placeholders exactly. Prefer compression, omission of filler, and cleaner spoken "
-                "phrasing over literal translation. "
-                'Return JSON only with this shape: {"text":"..."}.' 
-            )
-            user_prompt = (
-                "The current synthesized line is too long for its local subtitle window.\n"
-                f"Original subtitle duration: {segment.duration:.2f}s\n"
-                f"Current synthesized duration: {current_audio_duration:.2f}s\n"
-                f"Current local playback ratio: {current_audio_duration / max(segment.duration, 0.01):.2f}x\n"
-                f"Target synthesized duration: <= {target_audio_duration:.2f}s\n"
-                f"Target compact characters: <= {target_compact_chars}\n"
-                f"Current compact characters: {current_compact_chars}\n"
-                f"{_adaptation_placeholder_instruction(required_placeholders, strict)}\n"
-                f"English source: {masked_english}\n"
-                f"Current Chinese: {masked_chinese}"
-            )
-            parsed = self._complete_json(system_prompt, user_prompt)
-            candidate = str(parsed.get("text") or "").strip()
-            if not candidate:
-                continue
-            try:
-                restored = _restore_masked_text(candidate, required_placeholders, placeholder_to_term)
-            except RuntimeError:
-                continue
-            if _should_accept_timing_adaptation(
-                original_text=current_text,
-                candidate_text=restored,
-                target_compact_chars=target_compact_chars,
-                slack_chars=1,
-            ):
-                segment.chinese = restored
-                return True
-        return False
 
     def _translate_metadata_with_completion_model(self, metadata: VideoMetadata) -> VideoMetadata:
         term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
@@ -689,6 +361,36 @@ class OpenAICompatibleTranslator:
                 time.sleep(wait_seconds)
 
         raise RuntimeError("Translator request failed after retries") from last_error
+
+
+def llm_translation_enabled(*, base_url: str, model: str, api_key: str) -> bool:
+    normalized_base_url = base_url.strip()
+    normalized_model = model.strip()
+    normalized_api_key = api_key.strip()
+    if not normalized_base_url or not normalized_model:
+        return False
+    return bool(normalized_api_key or is_local_base_url(normalized_base_url))
+
+
+def is_local_base_url(base_url: str) -> bool:
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").strip().lower()
+    return hostname in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
+
+
+def ensure_endpoint_reachable(base_url: str, timeout: float = 3.0) -> None:
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").strip()
+    if not hostname:
+        raise RuntimeError(f"LLM base URL is invalid: {base_url}")
+    port = parsed.port
+    if port is None:
+        port = 443 if (parsed.scheme or "").lower() == "https" else 80
+    with socket.create_connection((hostname, port), timeout=timeout):
+        return
 
 
 def metadata_payload(metadata: VideoMetadata) -> dict[str, object]:
@@ -937,65 +639,18 @@ def _normalize_placeholder_variants(
     return PLACEHOLDER_VARIANT_RE.sub(replacer, text), unknown_tokens
 
 
-def _subtitle_completion_prompt(text: str, placeholders: list[str], strict: bool) -> str:
+def _subtitle_completion_prompt(text: str, placeholders: list[str], strict: bool, duration: float = 0.0) -> str:
+    char_budget = max(4, int(duration * 4.5))
+    budget_hint = (
+        f"Target duration: {duration:.1f}s, aim for at most {char_budget} Chinese characters. "
+    ) if duration > 0 else ""
     return (
         "Translate the following English subtitle into concise spoken Simplified Chinese. "
+        f"{budget_hint}"
         f"{_placeholder_instruction(placeholders, strict)} "
         "Return only the translation. No explanations. No quotes.\n\n"
         f"English: {text}\n"
         "Chinese:"
-    )
-
-
-def _subtitle_adaptation_completion_prompt(
-    english_text: str,
-    chinese_text: str,
-    placeholders: list[str],
-    strict: bool,
-    duration: float,
-    target_compact_chars: int,
-    current_compact_chars: int,
-) -> str:
-    return (
-        "Rewrite the following translated dubbing subtitle into shorter spoken Simplified Chinese. "
-        "Keep the original English meaning. Preserve names, product terms, filenames, numbers, and "
-        f"placeholder tokens exactly. {_adaptation_placeholder_instruction(placeholders, strict)} "
-        f"Target duration: {duration:.2f}s. "
-        f"Target compact characters (excluding spaces and punctuation): <= {target_compact_chars}. "
-        f"Current compact characters: {current_compact_chars}. "
-        "Remove filler and redundant wording. Return only the rewritten Chinese. No explanations. No quotes.\n\n"
-        f"English: {english_text}\n"
-        f"Current Chinese: {chinese_text}\n"
-        "Rewritten Chinese:"
-    )
-
-
-def _subtitle_audio_adaptation_completion_prompt(
-    english_text: str,
-    chinese_text: str,
-    placeholders: list[str],
-    strict: bool,
-    original_duration: float,
-    current_audio_duration: float,
-    target_audio_duration: float,
-    target_compact_chars: int,
-    current_compact_chars: int,
-) -> str:
-    return (
-        "The following translated dubbing line was synthesized too slowly for its local subtitle window. "
-        "Rewrite it into shorter, cleaner spoken Simplified Chinese while keeping the English meaning. "
-        "Preserve names, product terms, filenames, numbers, and placeholder tokens exactly. "
-        f"{_adaptation_placeholder_instruction(placeholders, strict)} "
-        f"Original subtitle duration: {original_duration:.2f}s. "
-        f"Current synthesized duration: {current_audio_duration:.2f}s. "
-        f"Target synthesized duration: <= {target_audio_duration:.2f}s. "
-        f"Target compact characters (excluding spaces and punctuation): <= {target_compact_chars}. "
-        f"Current compact characters: {current_compact_chars}. "
-        "Prefer compression, omission of filler, and tighter spoken phrasing. "
-        "Return only the rewritten Chinese. No explanations. No quotes.\n\n"
-        f"English: {english_text}\n"
-        f"Current Chinese: {chinese_text}\n"
-        "Rewritten Chinese:"
     )
 
 
@@ -1030,18 +685,6 @@ def _placeholder_instruction(placeholders: list[str], strict: bool) -> str:
         return (
             "The Chinese output must include these placeholders exactly as written: "
             f"{joined}. Do not omit, rename, or paraphrase them."
-        )
-    return f"Preserve these placeholders exactly if they appear: {joined}."
-
-
-def _adaptation_placeholder_instruction(placeholders: list[str], strict: bool) -> str:
-    if not placeholders:
-        return "Do not output any VC_TERM placeholder token."
-    joined = ", ".join(placeholders)
-    if strict:
-        return (
-            "The rewritten Chinese must preserve these placeholders exactly as written: "
-            f"{joined}."
         )
     return f"Preserve these placeholders exactly if they appear: {joined}."
 
@@ -1114,206 +757,6 @@ def _translate_completion_text(
         except RuntimeError as error:
             last_error = error
     raise RuntimeError(f"Failed to preserve protected terms for {empty_error_label}") from last_error
-
-
-def _adapt_completion_segment(
-    translator: OpenAICompatibleTranslator,
-    segment: Segment,
-    target_compact_cps: float,
-    slack_chars: int,
-    min_compact_chars: int,
-    term_to_placeholder: dict[str, str],
-    placeholder_to_term: dict[str, str],
-) -> bool:
-    current_text = segment.chinese.strip()
-    target_compact_chars = _target_compact_chars(
-        duration=segment.duration,
-        target_compact_cps=target_compact_cps,
-        min_compact_chars=min_compact_chars,
-    )
-    current_compact_chars = _compact_text_length(current_text)
-    masked_english, english_placeholders = _mask_text(segment.english, term_to_placeholder)
-    masked_chinese, chinese_placeholders = _mask_text(current_text, term_to_placeholder)
-    required_placeholders = _dedupe_strings([*english_placeholders, *chinese_placeholders])
-
-    last_error: Exception | None = None
-    for strict in (False, True):
-        completion = translator._complete_text(
-            prompt=_subtitle_adaptation_completion_prompt(
-                english_text=masked_english,
-                chinese_text=masked_chinese,
-                placeholders=required_placeholders,
-                strict=strict,
-                duration=segment.duration,
-                target_compact_chars=target_compact_chars,
-                current_compact_chars=current_compact_chars,
-            ),
-            max_tokens=_completion_max_tokens(current_text, minimum=96, maximum=220),
-        )
-        cleaned = _clean_completion_translation(completion)
-        if not cleaned:
-            last_error = RuntimeError(
-                f"Completion adapter returned empty text for segment {segment.index}"
-            )
-            continue
-        try:
-            restored = _restore_masked_text(cleaned, required_placeholders, placeholder_to_term)
-        except RuntimeError as error:
-            last_error = error
-            continue
-        if _should_accept_timing_adaptation(
-            original_text=current_text,
-            candidate_text=restored,
-            target_compact_chars=target_compact_chars,
-            slack_chars=slack_chars,
-        ):
-            segment.chinese = restored
-            return True
-        last_error = RuntimeError(
-            f"Timing adaptation did not shorten segment {segment.index} enough"
-        )
-    if last_error is not None:
-        return False
-    return False
-
-
-def _adapt_completion_segment_for_audio_timing(
-    translator: OpenAICompatibleTranslator,
-    segment: Segment,
-    target_playback_rate: float,
-    slack_seconds: float,
-    min_compact_chars: int,
-    term_to_placeholder: dict[str, str],
-    placeholder_to_term: dict[str, str],
-) -> bool:
-    current_text = segment.chinese.strip()
-    current_audio_duration = max(0.01, segment.synthetic_duration or segment.duration)
-    target_audio_duration = _target_audio_duration(
-        duration=segment.duration,
-        target_playback_rate=target_playback_rate,
-        slack_seconds=slack_seconds,
-    )
-    target_compact_chars = _target_audio_compact_chars(
-        current_text=current_text,
-        current_audio_duration=current_audio_duration,
-        target_audio_duration=target_audio_duration,
-        min_compact_chars=min_compact_chars,
-    )
-    current_compact_chars = _compact_text_length(current_text)
-    masked_english, english_placeholders = _mask_text(segment.english, term_to_placeholder)
-    masked_chinese, chinese_placeholders = _mask_text(current_text, term_to_placeholder)
-    required_placeholders = _dedupe_strings([*english_placeholders, *chinese_placeholders])
-
-    last_error: Exception | None = None
-    for strict in (False, True):
-        completion = translator._complete_text(
-            prompt=_subtitle_audio_adaptation_completion_prompt(
-                english_text=masked_english,
-                chinese_text=masked_chinese,
-                placeholders=required_placeholders,
-                strict=strict,
-                original_duration=segment.duration,
-                current_audio_duration=current_audio_duration,
-                target_audio_duration=target_audio_duration,
-                target_compact_chars=target_compact_chars,
-                current_compact_chars=current_compact_chars,
-            ),
-            max_tokens=_completion_max_tokens(current_text, minimum=96, maximum=220),
-        )
-        cleaned = _clean_completion_translation(completion)
-        if not cleaned:
-            last_error = RuntimeError(
-                f"Completion audio adapter returned empty text for segment {segment.index}"
-            )
-            continue
-        try:
-            restored = _restore_masked_text(cleaned, required_placeholders, placeholder_to_term)
-        except RuntimeError as error:
-            last_error = error
-            continue
-        if _should_accept_timing_adaptation(
-            original_text=current_text,
-            candidate_text=restored,
-            target_compact_chars=target_compact_chars,
-            slack_chars=1,
-        ):
-            segment.chinese = restored
-            return True
-        last_error = RuntimeError(
-            f"Audio timing adaptation did not shorten segment {segment.index} enough"
-        )
-    if last_error is not None:
-        return False
-    return False
-
-
-def _needs_timing_adaptation(
-    segment: Segment,
-    target_compact_cps: float,
-    slack_chars: int,
-    min_compact_chars: int,
-) -> bool:
-    if not segment.english.strip() or not segment.chinese.strip():
-        return False
-    target_compact_chars = _target_compact_chars(
-        duration=segment.duration,
-        target_compact_cps=target_compact_cps,
-        min_compact_chars=min_compact_chars,
-    )
-    current_compact_chars = _compact_text_length(segment.chinese)
-    return current_compact_chars > target_compact_chars + max(0, slack_chars)
-
-
-def _target_compact_chars(
-    duration: float,
-    target_compact_cps: float,
-    min_compact_chars: int,
-) -> int:
-    return max(min_compact_chars, int(round(max(0.01, duration) * target_compact_cps)))
-
-
-def _target_audio_duration(
-    duration: float,
-    target_playback_rate: float,
-    slack_seconds: float,
-) -> float:
-    return max(0.01, max(0.01, duration) * target_playback_rate + max(0.0, slack_seconds))
-
-
-def _target_audio_compact_chars(
-    current_text: str,
-    current_audio_duration: float,
-    target_audio_duration: float,
-    min_compact_chars: int,
-) -> int:
-    current_compact_chars = _compact_text_length(current_text)
-    if current_compact_chars <= 1:
-        return current_compact_chars
-    ratio = min(0.999, max(0.1, target_audio_duration / max(current_audio_duration, 0.01)))
-    scaled_target = int(round(current_compact_chars * ratio))
-    scaled_target = min(current_compact_chars - 1, scaled_target)
-    return max(min_compact_chars, scaled_target)
-
-
-def _compact_text_length(text: str) -> int:
-    return len(COMPACT_TEXT_DROP_RE.sub("", text))
-
-
-def _should_accept_timing_adaptation(
-    original_text: str,
-    candidate_text: str,
-    target_compact_chars: int,
-    slack_chars: int,
-) -> bool:
-    if not candidate_text.strip():
-        return False
-    original_compact = _compact_text_length(original_text)
-    candidate_compact = _compact_text_length(candidate_text)
-    if candidate_compact <= 0:
-        return False
-    if candidate_compact <= target_compact_chars + max(0, slack_chars):
-        return candidate_compact < original_compact or len(candidate_text) < len(original_text)
-    return candidate_compact <= max(1, original_compact - 2)
 
 
 def _dedupe_strings(values: Iterable[str]) -> list[str]:

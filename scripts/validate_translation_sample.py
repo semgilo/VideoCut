@@ -3,13 +3,11 @@ from __future__ import annotations
 
 import argparse
 import re
-import socket
 import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -22,7 +20,12 @@ from videocut.subtitles import (
     load_chinese_segments_from_vtt,
     load_segments_from_vtt,
 )
-from videocut.translate import OpenAICompatibleTranslator, load_protected_terms
+from videocut.translate import (
+    OpenAICompatibleTranslator,
+    ensure_endpoint_reachable,
+    is_local_base_url,
+    load_protected_terms,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -101,7 +104,13 @@ def main() -> None:
 
     config = PipelineConfig()
     _ensure_llm_ready(config)
-    _ensure_endpoint_reachable(config.llm_base_url)
+    try:
+        ensure_endpoint_reachable(config.llm_base_url)
+    except OSError as error:
+        raise RuntimeError(
+            "LLM endpoint is not reachable. "
+            "Start the local OpenAI-compatible server or update VIDEOCUT_LLM_BASE_URL."
+        ) from error
     protected_terms = load_protected_terms(config.protected_terms_path)
 
     all_english_segments = load_segments_from_vtt(english_vtt)
@@ -255,33 +264,6 @@ def _ensure_llm_ready(config: PipelineConfig) -> None:
     raise RuntimeError(
         "LLM translation requires VIDEOCUT_LLM_API_KEY unless the base URL is local."
     )
-
-
-def _is_local_base_url(base_url: str) -> bool:
-    try:
-        parsed = urlparse(base_url)
-    except ValueError:
-        return False
-    hostname = (parsed.hostname or "").strip().lower()
-    return hostname in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
-
-
-def _ensure_endpoint_reachable(base_url: str) -> None:
-    parsed = urlparse(base_url)
-    hostname = (parsed.hostname or "").strip()
-    if not hostname:
-        raise RuntimeError(f"LLM base URL is invalid: {base_url}")
-    port = parsed.port
-    if port is None:
-        port = 443 if (parsed.scheme or "").lower() == "https" else 80
-    try:
-        with socket.create_connection((hostname, port), timeout=3):
-            return
-    except OSError as error:
-        raise RuntimeError(
-            f"LLM endpoint is not reachable at {hostname}:{port}. "
-            "Start the local OpenAI-compatible server or update VIDEOCUT_LLM_BASE_URL."
-        ) from error
 
 
 def _select_sample_segments(

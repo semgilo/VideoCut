@@ -148,6 +148,20 @@ Copy the environment template:
 cp .env.example .env
 ```
 
+If you want the whole workflow to be driven by a single config file, also copy the TOML template:
+
+```bash
+cp videocut.example.toml videocut.toml
+```
+
+After that, the default entry point is simply:
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+The CLI auto-loads `videocut.toml` from the current directory when it exists. Command-line flags override the TOML values.
+
 ### Translation settings
 
 ```env
@@ -159,6 +173,22 @@ VIDEOCUT_LLM_MODEL=Qwen3.5-9B-MLX-4bit
 If the source video already has `zh-Hans`, `zh-CN`, or `zh-Hant` subtitles, VideoCut can still complete without any LLM by reusing the Chinese track.
 
 For a hosted provider, keep the same base URL pattern and fill in `VIDEOCUT_LLM_API_KEY`.
+
+### Local parallel translation guidance
+
+If you want the local model server to translate subtitles in parallel, prefer chat models that support `/v1/chat/completions`, for example:
+
+```env
+VIDEOCUT_LLM_BASE_URL=http://127.0.0.1:8888/v1
+VIDEOCUT_LLM_API_KEY=your_local_api_key
+VIDEOCUT_LLM_MODEL=Qwen3.5-9B-MLX-4bit
+VIDEOCUT_TRANSLATION_BATCH_SIZE=25
+VIDEOCUT_TRANSLATION_CONCURRENCY=4
+```
+
+Start with `VIDEOCUT_TRANSLATION_CONCURRENCY=2` or `4`, then raise it only after checking local memory pressure and server stability.
+
+Do not treat `translategemma-*` as the default high-throughput local model. The current code detects model names that start with `translategemma` and routes them through the per-line `/v1/completions` path. That still supports concurrency, but it sends many more requests and is usually less stable on longer videos than the batched JSON chat-model path.
 
 ### Default TTS path: CosyVoice
 
@@ -266,6 +296,62 @@ videocut run "https://www.youtube.com/shorts/4br1vok5ohk" \
 
 This command assumes your local OpenAI-compatible model server is already running and your local `CosyVoice` repo plus weights are configured.
 
+### Subtitle-only mode with no dubbing and no voice cloning
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --mode subtitle_only \
+  --config videocut.toml
+```
+
+Recommended `videocut.toml` block:
+
+```toml
+[pipeline]
+mode = "subtitle_only"
+translation_backend = "llm"
+export_platform_materials = true
+output_name = "final_subtitled.mp4"
+
+[translation]
+llm_base_url = "http://127.0.0.1:8888/v1"
+llm_api_key = "your_local_api_key"
+llm_model = "Qwen3.5-9B-MLX-4bit"
+batch_size = 25
+concurrency = 4
+```
+
+If the local model endpoint is temporarily unstable but you still want the subtitle-only deliverable and platform kits, switch the config to:
+
+```toml
+[pipeline]
+translation_backend = "google"
+```
+
+### AI agent call pattern
+
+If the user says any of the following:
+
+- subtitle translation only
+- no dubbing
+- no voice cloning
+- generate Douyin / Bilibili / Xiaohongshu materials without exporting multiple video versions
+
+Prefer this entry point:
+
+```bash
+videocut run "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --mode subtitle_only \
+  --config videocut.toml
+```
+
+And follow these rules:
+
+1. If the user explicitly wants local parallel model processing, set `VIDEOCUT_LLM_MODEL` to a chat model such as `Qwen3.5-9B-MLX-4bit` and set `VIDEOCUT_TRANSLATION_CONCURRENCY=2` or `4`.
+2. Subtitle-only requests should still use `videocut run`; switch the workflow only through `--mode subtitle_only` and the config file.
+3. If the local LLM endpoint is unavailable or unstable, keep the same CLI and switch the config file to `translation_backend = "google"`.
+4. The default output directory is `runs/<video_id>-subtitle-only-<date>/`.
+
 ### Choose a custom work directory
 
 ```bash
@@ -347,6 +433,7 @@ Each run creates a working directory under `runs/` or your custom `--workdir`.
 
 - `source/`: downloaded video, subtitle files, thumbnail, source metadata, and extracted audio
 - `subtitles/zh.srt`: generated Chinese subtitles
+- `final_subtitled.mp4`: final subtitle-only export with original audio retained
 - `tts/`: per-segment synthesized audio files
 - `tts/reference_prompt.wav`: auto-extracted reference audio for `CosyVoice`
 - `tts/cosyvoice_inputs.json`: `CosyVoice` batch input manifest
@@ -360,6 +447,10 @@ Each run creates a working directory under `runs/` or your custom `--workdir`.
 - `publish/description.txt`: localized Chinese description
 - `publish/metadata.json`: structured source + localized metadata
 - `publish/content_preview.html`: local preview page for the final video and metadata
+- `platforms/<platform>/cover.jpg`: platform-sized cover image
+- `platforms/<platform>/cover_source.jpg`: original cover source backup
+- `platforms/<platform>/requirements.md`: public upload requirements plus fit assessment
+- `platforms/<platform>/title.txt` / `description.txt` / `hashtags.txt`: platform packaging materials
 - `manifest.json`: full run manifest for inspection or re-rendering
 
 ## Utility Scripts

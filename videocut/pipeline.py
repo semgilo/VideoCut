@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.parse import urlparse
 
 from videocut.asr import extract_audio_for_asr, transcribe_with_faster_whisper
 from videocut.config import PipelineConfig
-from videocut.dub_timing import repair_segments_for_audio_timing
 from videocut.downloader import download_youtube_assets
 from videocut.media import (
     compose_dubbed_track,
-    finalize_synthesized_segments,
-    ffprobe_duration,
+    measure_synthesized_segments,
     render_final_video,
     write_manifest,
 )
@@ -22,12 +19,23 @@ from videocut.subtitles import (
     overlay_english_from_vtt,
     write_srt,
 )
-from videocut.timing import plan_dubbing_timing_with_fallback
-from videocut.translate import OpenAICompatibleTranslator, load_protected_terms
+from videocut.timing import schedule_dubbing_timing
+from videocut.translate import (
+    OpenAICompatibleTranslator,
+    load_protected_terms,
+    llm_translation_enabled,
+)
 from videocut.tts import synthesize_segments
 
 
 def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) -> Path:
+    if config.pipeline_mode == "subtitle_only":
+        from videocut.subtitle_only import run_subtitle_only_pipeline
+
+        if config.output_name == "final_cn.mp4":
+            config.output_name = "final_subtitled.mp4"
+        return run_subtitle_only_pipeline(url, config, workdir=workdir)
+
     run_dir = workdir or _make_run_dir(config.runs_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -37,7 +45,11 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     audio_dir = run_dir / "audio"
 
     print(f"Working directory: {run_dir}")
-    llm_enabled = _llm_translation_enabled(config)
+    llm_enabled = llm_translation_enabled(
+        base_url=config.llm_base_url,
+        model=config.llm_model,
+        api_key=config.llm_api_key,
+    )
     download = download_youtube_assets(
         url,
         source_dir,
@@ -106,19 +118,6 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         )
         print("Translating subtitles...")
         translator.translate(segments)
-        if config.translation_timing_adapt:
-            adapted_count = translator.adapt_subtitles_for_timing(
-                segments=segments,
-                target_compact_cps=config.translation_target_compact_cps,
-                slack_chars=config.translation_adapt_slack_chars,
-                passes=config.translation_adapt_passes,
-                min_compact_chars=config.translation_adapt_min_chars,
-            )
-            if adapted_count:
-                print(
-                    "Adapted translated lines for dubbing timing: "
-                    f"{adapted_count}/{len(segments)} segments"
-                )
     elif download.chinese_subtitle_path is not None:
         if segments is english_segments and download.english_subtitle_path is not None:
             print(
@@ -150,72 +149,31 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     else:
         print("No translation endpoint configured. Source title, tags, and description are kept as-is.")
 
-    print("Synthesizing Chinese dubbing...")
+    print("Synthesizing Chinese dubbing with CosyVoice...")
     synthesize_segments(
         segments=segments,
         output_dir=tts_dir,
         config=config,
         source_video=download.video_path,
     )
-    trimmed_segments, total_leading_trim, total_trailing_trim = finalize_synthesized_segments(
-        segments=segments,
-        trim_silence=config.trim_tts_silence,
-        silence_threshold_db=config.tts_silence_threshold_db,
-        min_silence_duration=config.tts_silence_min_duration,
-        keep_silence=config.tts_keep_silence,
-    )
-    if trimmed_segments:
-        print(
-            "Trimmed TTS silence: "
-            f"{trimmed_segments} segments, "
-            f"{total_leading_trim:.2f}s leading and {total_trailing_trim:.2f}s trailing removed"
-        )
-    repaired_lines, resynthesized_lines = repair_segments_for_audio_timing(
-        segments=segments,
-        output_dir=tts_dir,
-        config=config,
-        source_video=download.video_path,
-        translator=translator,
-    )
-    if repaired_lines:
-        print(
-            "Audio timing repair completed: "
-            f"{repaired_lines} subtitle rewrites, {resynthesized_lines} segment re-syntheses"
-        )
 
-    video_duration = ffprobe_duration(download.video_path)
-    used_timing_mode, used_max_playback_rate, used_max_segment_lag = plan_dubbing_timing_with_fallback(
+    measure_synthesized_segments(segments)
+
+    schedule_dubbing_timing(
         segments=segments,
-        video_duration=video_duration,
-        timing_mode=config.timing_mode,
-        max_opening_silence=config.max_opening_silence,
-        max_global_shift=config.max_global_shift,
-        min_segment_gap=config.min_segment_gap,
-        min_playback_rate=config.min_playback_rate,
         max_playback_rate=config.max_playback_rate,
-        max_segment_lag=config.max_segment_lag,
     )
+
     first_spoken_at = min(segment.render_start for segment in segments)
     max_rate = max(segment.playback_rate for segment in segments)
     print(
-        "Dub timing scheduled: "
-        f"first speech at {first_spoken_at:.2f}s, max playback rate {max_rate:.2f}x"
+        f"Dub timing scheduled: first speech at {first_spoken_at:.2f}s, "
+        f"max playback rate {max_rate:.2f}x"
     )
-    if (
-        used_timing_mode != config.timing_mode
-        or abs(used_max_playback_rate - config.max_playback_rate) > 0.001
-        or abs(used_max_segment_lag - config.max_segment_lag) > 0.001
-    ):
-        print(
-            "Timing fallback applied: "
-            f"mode={used_timing_mode}, "
-            f"max_playback_rate={used_max_playback_rate:.2f}, "
-            f"max_segment_lag={used_max_segment_lag:.2f}"
-        )
 
     generated_srt = subtitles_dir / "zh.srt"
-    write_srt(generated_srt, segments)
-    print(f"Chinese subtitle file generated: {generated_srt}")
+    write_srt(generated_srt, segments, bilingual=True)
+    print(f"Bilingual subtitle file generated: {generated_srt}")
 
     dubbed_track = compose_dubbed_track(
         video_path=download.video_path,
@@ -260,6 +218,13 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         publish_assets=publish_assets,
     )
     print(f"Final video exported: {final_video}")
+
+    if config.cleanup_source_after_publish:
+        import shutil
+        if source_dir.exists():
+            shutil.rmtree(source_dir)
+            print(f"Source directory cleaned up: {source_dir}")
+
     return final_video
 
 
@@ -268,23 +233,3 @@ def _make_run_dir(runs_dir: Path) -> Path:
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return runs_dir / timestamp
-
-
-def _llm_translation_enabled(config: PipelineConfig) -> bool:
-    base_url = config.llm_base_url.strip()
-    model = config.llm_model.strip()
-    api_key = config.llm_api_key.strip()
-    if not base_url or not model:
-        return False
-    if api_key:
-        return True
-    return _is_local_base_url(base_url)
-
-
-def _is_local_base_url(base_url: str) -> bool:
-    try:
-        parsed = urlparse(base_url)
-    except ValueError:
-        return False
-    hostname = (parsed.hostname or "").strip().lower()
-    return hostname in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}

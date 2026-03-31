@@ -1,16 +1,16 @@
 [pipeline]
 mode = "subtitle_only"
-translation_backend = "llm"
+translation_backend = "auto"
 export_platform_materials = true
 output_name = "final_subtitled.mp4"
 runs_dir = "runs"
 
 [translation]
 llm_base_url = "http://127.0.0.1:8888/v1"
-llm_api_key = "replace_with_your_local_api_key"
+llm_api_key = "2530"
 llm_model = "translategemma-4b-it-mlx-4bit"
 llm_timeout = 120
-batch_size = 25
+batch_size = 10
 concurrency = 4
 timing_adapt = false
 target_compact_cps = 4.6

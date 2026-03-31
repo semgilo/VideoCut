@@ -5,15 +5,33 @@ import subprocess
 from pathlib import Path
 
 
+_FFMPEG_FULL_CANDIDATES = [
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+    "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+]
+_FFPROBE_FULL_CANDIDATES = [
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe",
+    "/usr/local/opt/ffmpeg-full/bin/ffprobe",
+]
+
+
+def _find_binary(candidates: list[str], fallback: str) -> str:
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    return fallback
+
+
+_FFMPEG_BIN: str = _find_binary(_FFMPEG_FULL_CANDIDATES, "ffmpeg")
+_FFPROBE_BIN: str = _find_binary(_FFPROBE_FULL_CANDIDATES, "ffprobe")
+
+
 def resolve_tool_binary(name: str) -> str:
-    env_key = {
-        "ffmpeg": "VIDEOCUT_FFMPEG_BIN",
-        "ffprobe": "VIDEOCUT_FFPROBE_BIN",
-    }.get(name)
-    if env_key is None:
-        return name
-    configured = os.getenv(env_key, "").strip()
-    return configured or name
+    if name == "ffmpeg":
+        return _FFMPEG_BIN
+    if name == "ffprobe":
+        return _FFPROBE_BIN
+    return name
 
 
 def _normalize_command(args: list[str]) -> list[str]:

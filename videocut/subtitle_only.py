@@ -1,19 +1,13 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import re
-import socket
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from deep_translator import GoogleTranslator
 from PIL import Image, ImageEnhance, ImageFilter
@@ -37,10 +31,12 @@ from videocut.subtitles import (
     overlay_english_from_vtt,
     write_srt,
 )
-from videocut.translate import OpenAICompatibleTranslator, load_protected_terms
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from videocut.translate import (
+    OpenAICompatibleTranslator,
+    ensure_endpoint_reachable,
+    load_protected_terms,
+    llm_translation_enabled,
+)
 
 
 @dataclass(slots=True)
@@ -168,34 +164,12 @@ PLATFORM_SPECS = {
 }
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Download a YouTube video, translate subtitles to Chinese, keep original audio, and export platform material kits.",
-    )
-    parser.add_argument("url", help="YouTube video URL")
-    parser.add_argument(
-        "--workdir",
-        type=Path,
-        help="Optional output directory. Defaults to runs/<video_id>-subtitle-only-<date>.",
-    )
-    parser.add_argument(
-        "--no-burn-subtitles",
-        action="store_true",
-        help="Do not burn subtitles into the exported MP4. The SRT will still be generated.",
-    )
-    parser.add_argument(
-        "--translation-backend",
-        choices=("auto", "llm", "google"),
-        default="auto",
-        help="Subtitle translation backend. auto prefers the configured LLM and falls back to Google Translate.",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    config = PipelineConfig()
-    run_dir = args.workdir.expanduser().resolve() if args.workdir else _default_run_dir(args.url)
+def run_subtitle_only_pipeline(
+    url: str,
+    config: PipelineConfig,
+    workdir: Path | None = None,
+) -> Path:
+    run_dir = workdir.expanduser().resolve() if workdir else _default_run_dir(url, config.runs_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     source_dir = run_dir / "source"
@@ -204,22 +178,26 @@ def main() -> None:
     platforms_dir = run_dir / "platforms"
 
     print(f"Working directory: {run_dir}")
-    llm_enabled = _llm_translation_enabled(config)
-    if args.translation_backend == "llm" and not llm_enabled:
+    llm_enabled = llm_translation_enabled(
+        base_url=config.llm_base_url,
+        model=config.llm_model,
+        api_key=config.llm_api_key,
+    )
+    if config.translation_backend == "llm" and not llm_enabled:
         raise RuntimeError("LLM translation was requested, but the configured endpoint is unavailable.")
-    if llm_enabled and args.translation_backend != "google":
+    if llm_enabled and config.translation_backend != "google":
         try:
-            _ensure_endpoint_reachable(config.llm_base_url)
+            ensure_endpoint_reachable(config.llm_base_url)
         except OSError as error:
-            if args.translation_backend == "llm":
+            if config.translation_backend == "llm":
                 raise RuntimeError(f"LLM endpoint is unreachable: {error}") from error
             print(f"Warning: LLM endpoint is unreachable, falling back to Google Translate: {error}")
             llm_enabled = False
 
     download = download_youtube_assets(
-        args.url,
+        url,
         source_dir,
-        include_chinese_subtitles=True,
+        include_chinese_subtitles=False,
     )
     _recover_download_artifacts(download, source_dir)
     print(f"Downloaded source video: {download.video_path}")
@@ -229,14 +207,18 @@ def main() -> None:
     print(f"Subtitle segments ready: {len(segments)}")
 
     translator: OpenAICompatibleTranslator | None = None
+    subtitle_translation_backend = "none"
     protected_terms = load_protected_terms(config.protected_terms_path)
     if protected_terms:
         print(
             f"Loaded {len(protected_terms)} protected terms from {config.protected_terms_path}"
         )
-    if args.translation_backend == "google":
+    if not _segments_need_translation(segments):
+        print("Subtitle source is already Chinese. Skipping subtitle translation.")
+    elif config.translation_backend == "google":
         print("Translating subtitles with Google Translate fallback...")
         _translate_segments_with_google(segments)
+        subtitle_translation_backend = "google"
     elif llm_enabled:
         translator = OpenAICompatibleTranslator(
             base_url=config.llm_base_url,
@@ -250,11 +232,13 @@ def main() -> None:
         print("Translating subtitles to Simplified Chinese...")
         try:
             translator.translate(segments)
+            subtitle_translation_backend = "llm"
         except Exception as error:
-            if args.translation_backend == "llm":
+            if config.translation_backend == "llm":
                 raise
             print(f"Warning: LLM translation failed, falling back to Google Translate: {error}")
             _translate_segments_with_google(segments)
+            subtitle_translation_backend = "google"
     elif download.chinese_subtitle_path is not None:
         if download.english_subtitle_path is not None and any(segment.english for segment in segments):
             print(
@@ -263,29 +247,37 @@ def main() -> None:
             overlay_chinese_from_vtt(segments, download.chinese_subtitle_path)
         else:
             print("Using downloaded Chinese subtitle track directly.")
+        subtitle_translation_backend = "native_zh"
     else:
         print("No LLM endpoint or Chinese subtitle track available. Falling back to Google Translate.")
         _translate_segments_with_google(segments)
+        subtitle_translation_backend = "google"
 
     localized_metadata = download.source_metadata
-    if download.source_metadata is not None and translator is not None:
+    if (
+        download.source_metadata is not None
+        and subtitle_translation_backend == "llm"
+        and translator is not None
+    ):
         print("Translating title, description, and tags...")
         try:
             localized_metadata = translator.translate_metadata(download.source_metadata)
         except Exception as error:
-            if args.translation_backend == "llm":
+            if config.translation_backend == "llm":
                 raise
             print(f"Warning: metadata LLM translation failed, falling back to Google Translate: {error}")
             localized_metadata = _translate_metadata_with_google(download.source_metadata)
-    elif download.source_metadata is not None and args.translation_backend == "google":
+    elif download.source_metadata is not None and (
+        config.translation_backend == "google" or subtitle_translation_backend == "google"
+    ):
         print("Translating title, description, and tags with Google Translate fallback...")
         localized_metadata = _translate_metadata_with_google(download.source_metadata)
     elif download.source_metadata is None:
         print("Warning: no source metadata was downloaded.")
 
     generated_srt = subtitles_dir / "zh.srt"
-    write_srt(generated_srt, segments)
-    print(f"Chinese subtitle file generated: {generated_srt}")
+    write_srt(generated_srt, segments, bilingual=True)
+    print(f"Bilingual subtitle file generated: {generated_srt}")
 
     original_track = compose_dubbed_track(
         video_path=download.video_path,
@@ -300,8 +292,8 @@ def main() -> None:
         video_path=download.video_path,
         dubbed_track_path=original_track,
         subtitle_path=generated_srt,
-        output_path=run_dir / "final_subtitled.mp4",
-        burn_subtitles=not args.no_burn_subtitles,
+        output_path=run_dir / config.output_name,
+        burn_subtitles=config.burn_subtitles,
         subtitle_font=config.subtitle_font,
         subtitle_font_path=config.subtitle_font_path,
         subtitle_font_size=config.subtitle_font_size,
@@ -320,15 +312,16 @@ def main() -> None:
     )
 
     video_profile = _collect_video_profile(final_video)
-    _export_platform_kits(
-        output_dir=platforms_dir,
-        final_video=final_video,
-        subtitle_path=generated_srt,
-        publish_assets=publish_assets,
-        source_metadata=download.source_metadata,
-        localized_metadata=localized_metadata,
-        video_profile=video_profile,
-    )
+    if config.export_platform_materials:
+        _export_platform_kits(
+            output_dir=platforms_dir,
+            final_video=final_video,
+            subtitle_path=generated_srt,
+            publish_assets=publish_assets,
+            source_metadata=download.source_metadata,
+            localized_metadata=localized_metadata,
+            video_profile=video_profile,
+        )
     _write_delivery_summary(
         output_dir=run_dir,
         final_video=final_video,
@@ -352,12 +345,13 @@ def main() -> None:
         publish_assets=publish_assets,
     )
     print(f"Manifest written to {run_dir / 'manifest.json'}")
+    return final_video
 
 
-def _default_run_dir(url: str) -> Path:
+def _default_run_dir(url: str, runs_dir: Path) -> Path:
     video_id = _extract_video_id(url)
     stamp = datetime.now().strftime("%Y%m%d")
-    return (REPO_ROOT / "runs" / f"{video_id}-subtitle-only-{stamp}").resolve()
+    return (runs_dir / f"{video_id}-subtitle-only-{stamp}").resolve()
 
 
 def _extract_video_id(url: str) -> str:
@@ -428,13 +422,8 @@ def _recover_download_artifacts(download, source_dir: Path) -> None:
             print(f"Warning: failed to recover source metadata from info.json: {error}")
 
 
-def _llm_translation_enabled(config: PipelineConfig) -> bool:
-    base_url = config.llm_base_url.strip()
-    model = config.llm_model.strip()
-    api_key = config.llm_api_key.strip()
-    if not base_url or not model:
-        return False
-    return bool(api_key or _is_local_base_url(base_url))
+def _segments_need_translation(segments: list[Segment]) -> bool:
+    return any(segment.english.strip() for segment in segments)
 
 
 def _translate_segments_with_google(segments: list[Segment]) -> None:
@@ -484,27 +473,6 @@ def _translate_metadata_with_google(metadata: VideoMetadata) -> VideoMetadata:
     )
 
 
-def _is_local_base_url(base_url: str) -> bool:
-    try:
-        parsed = urlparse(base_url)
-    except ValueError:
-        return False
-    hostname = (parsed.hostname or "").strip().lower()
-    return hostname in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
-
-
-def _ensure_endpoint_reachable(base_url: str) -> None:
-    parsed = urlparse(base_url)
-    hostname = (parsed.hostname or "").strip()
-    if not hostname:
-        raise RuntimeError(f"LLM base URL is invalid: {base_url}")
-    port = parsed.port
-    if port is None:
-        port = 443 if (parsed.scheme or "").lower() == "https" else 80
-    with socket.create_connection((hostname, port), timeout=3):
-        return
-
-
 def _collect_video_profile(video_path: Path) -> dict[str, object]:
     width, height = ffprobe_video_size(video_path)
     duration_seconds = ffprobe_duration(video_path)
@@ -551,7 +519,7 @@ def _export_platform_kits(
             base_metadata=base_metadata,
             hashtags=hashtags,
         )
-        cover_text = _build_cover_text(base_metadata.title)
+        cover_text = _build_cover_text(base_metadata.title, spec)
         compatibility = _evaluate_compatibility(spec, video_profile)
         generated_cover_path = _export_platform_cover_assets(
             spec=spec,
@@ -650,10 +618,26 @@ def _derive_keywords(
 
 def _build_platform_title(spec: PlatformSpec, base_title: str) -> str:
     clean = _normalize_space(base_title) or "视频字幕翻译版"
+    title_lower = clean.lower()
+
     if spec.slug == "douyin":
         return _truncate_text(f"{clean}｜中文字幕版", 36)
+
     if spec.slug == "bilibili":
         return _truncate_text(f"【中文字幕】{clean}", 60)
+
+    if spec.slug == "xiaohongshu":
+        # XHS style: catchy, emoji, shorter
+        if "openclaw" in title_lower:
+            return "OpenClaw教程｜本地AI自动化神器 🚀"
+        if "local" in title_lower or "llm" in title_lower:
+            if any(x in title_lower for x in ["$", "money", "万", "花", "spent"]):
+                return "花了5万刀测试后｜本地AI入门全攻略💰"
+            return "本地AI模型教程｜零门槛上手 🔥"
+        if "how to" in title_lower or "guide" in title_lower:
+            return f"{clean[:20]}｜超详细教程 ⭐"
+        return _truncate_text(f"{clean}｜中文字幕版", 22)
+
     return _truncate_text(f"【字幕翻译】{clean}", 22)
 
 
@@ -663,6 +647,10 @@ def _build_hashtags(spec: PlatformSpec, keywords: list[str]) -> list[str]:
         return tags[:5]
     if spec.slug == "bilibili":
         return tags[:6]
+    if spec.slug == "xiaohongshu":
+        # XHS can use up to 10 hashtags, add some general ones
+        xhs_extra = ["#干货分享", "#学习笔记", "#科技数码"]
+        return (tags + xhs_extra)[:10]
     return tags[:5]
 
 
@@ -704,6 +692,9 @@ def _build_platform_description(
         lines.append("标签建议：" + " ".join(hashtags))
         return "\n".join(line for line in lines if line) + "\n"
 
+    if spec.slug == "xiaohongshu":
+        return _build_xiaohongshu_description(base_metadata, source_metadata, hashtags)
+
     lines = [
         "这是一条中文字幕翻译版视频，保留原声，不做配音。",
         base_summary,
@@ -713,8 +704,126 @@ def _build_platform_description(
     return "\n".join(line for line in lines if line) + "\n"
 
 
-def _build_cover_text(title: str) -> str:
+def _build_xiaohongshu_description(
+    base_metadata: VideoMetadata,
+    source_metadata: VideoMetadata | None,
+    hashtags: list[str],
+) -> str:
+    """Generate Xiaohongshu-style notes based on video content."""
+    title_lower = (base_metadata.title or "").lower()
+    desc_lower = (base_metadata.description or "").lower()
+    combined = title_lower + " " + desc_lower
+
+    # Detect content topics
+    is_ai_local = "local" in combined or "本地" in combined or "llm" in combined
+    is_openclaw = "openclaw" in combined
+    is_tutorial = "how to" in combined or "guide" in combined or "教程" in combined
+    is_money = "money" in combined or "$" in combined or "万" in combined or "赚" in combined
+
+    lines = []
+
+    # Opening hook
+    if is_money and is_ai_local:
+        lines.append("姐妹们！今天分享一个超硬核的AI教程 🔥")
+        lines.append("")
+        lines.append(f"博主@{source_metadata.uploader if source_metadata else '原作者'} 花了大量时间和金钱测试各种AI工具，最终整理出这份实用指南")
+    elif is_openclaw:
+        lines.append("发现了一个超实用的AI自动化工具！🚀")
+        lines.append("")
+        lines.append("OpenClaw 可以让你用自然语言指挥AI完成各种任务，不用写代码也能搭建自动化 workflow")
+    elif is_tutorial:
+        lines.append("干货分享！今天这个教程值得收藏 ⭐")
+        lines.append("")
+        lines.append("英文字幕已翻译，内容硬核但讲得很清楚，小白也能看懂")
+    else:
+        lines.append("今天分享一个超赞的英文视频翻译版 🎬")
+        lines.append("")
+        lines.append("原视频干货满满，已经加上了中文字幕，方便大家食用～")
+
+    lines.append("")
+    lines.append("📌 视频亮点速览：")
+    lines.append("")
+
+    # Generate bullet points based on content
+    if is_ai_local:
+        lines.append("1️⃣ 什么是本地AI？")
+        lines.append("不需要联网、数据还私密，完全在你自己设备上运行的AI")
+        lines.append("")
+        lines.append("2️⃣ 需要什么设备？")
+        lines.append("从普通电脑到专业设备，博主会告诉你不同预算的配置方案")
+        lines.append("")
+
+    if is_openclaw:
+        lines.append(f"{'3️⃣' if is_ai_local else '1️⃣'} OpenClaw 能做什么？")
+        lines.append("连接各种AI模型和工具，让AI自动帮你完成复杂任务")
+        lines.append("")
+
+    if is_money:
+        lines.append(f"{'4️⃣' if (is_ai_local and is_openclaw) else ('3️⃣' if (is_ai_local or is_openclaw) else '2️⃣')} 省钱/赚钱思路")
+        lines.append("不用订阅一堆付费服务，本地部署一次搞定，还能接私活")
+        lines.append("")
+
+    # Add generic points if we don't have enough
+    point_num = 2 if (is_ai_local and is_openclaw and is_money) else (
+        3 if ((is_ai_local and is_openclaw) or (is_ai_local and is_money) or (is_openclaw and is_money)) else (
+        4 if (is_ai_local or is_openclaw or is_money) else 1
+    ))
+
+    if point_num <= 3:
+        lines.append(f"{point_num}️⃣ 实用技巧")
+        lines.append("博主分享了很多实操经验，跟着做就能上手")
+        lines.append("")
+        point_num += 1
+
+    # Target audience
+    lines.append("💡 适合谁看：")
+    if is_ai_local:
+        lines.append("» 担心隐私泄露，不想把数据传到云端的宝子")
+        lines.append("» 想省钱，不想每个月交各种AI订阅费的")
+    if is_openclaw:
+        lines.append("» 想用AI提效，但不想学编程的")
+    lines.append("» 对AI感兴趣，想从零开始学的")
+    lines.append("")
+
+    # Closing
+    lines.append("🎬 英文字幕已翻译，放心食用～")
+    lines.append("")
+
+    # Origin info
+    if source_metadata and source_metadata.webpage_url:
+        lines.append(f"原视频：{source_metadata.webpage_url}")
+        if source_metadata.uploader or source_metadata.channel:
+            lines.append(f"来源频道：{source_metadata.channel or source_metadata.uploader}")
+        lines.append("")
+
+    # Hashtags
+    lines.append(" ".join(hashtags[:8]))  # XHS can use more hashtags
+
+    return "\n".join(lines) + "\n"
+
+
+def _build_cover_text(title: str, spec: PlatformSpec | None = None) -> str:
     normalized = _normalize_space(title)
+    title_lower = normalized.lower()
+
+    # XHS specific cover text
+    if spec and spec.slug == "xiaohongshu":
+        if "openclaw" in title_lower:
+            return "OpenClaw\nAI自动化神器"
+        if "local" in title_lower or "llm" in title_lower:
+            if any(x in title_lower for x in ["$", "money", "万", "花", "spent"]):
+                return "5万刀实测\n本地AI攻略"
+            return "本地AI\n零基础入门"
+        if "how to" in title_lower or "教程" in title_lower:
+            return "硬核教程\n建议收藏"
+        # Default XHS style
+        compact = re.sub(r"^[【\[].*?[】\]]", "", normalized).strip()
+        compact = re.split(r"[：:|｜\-]", compact)[0].strip()
+        if len(compact) > 10:
+            return _truncate_text(compact, 10) + "\n干货分享"
+        return (compact or "中文字幕") + "\n建议收藏"
+
+    # Default for other platforms
     if re.search(r"\bopenclaw\b", normalized, flags=re.IGNORECASE):
         return "OpenClaw 5个实用场景"
     compact = re.sub(r"^[【\[].*?[】\]]", "", normalized).strip()
@@ -1016,7 +1125,3 @@ def _format_bytes(value: int | None) -> str:
             return f"{amount:.2f}{suffix}"
         amount /= 1024
     return f"{value}B"
-
-
-if __name__ == "__main__":
-    main()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -71,155 +70,14 @@ def ffprobe_video_size(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def finalize_synthesized_segments(
-    segments: list[Segment],
-    trim_silence: bool,
-    silence_threshold_db: float,
-    min_silence_duration: float,
-    keep_silence: float,
-) -> tuple[int, float, float]:
-    trimmed_segments = 0
-    total_leading_trim = 0.0
-    total_trailing_trim = 0.0
-
+def measure_synthesized_segments(segments: list[Segment]) -> None:
+    """Measure and store synthetic_duration for each segment after CosyVoice synthesis."""
     for segment in segments:
         if segment.audio_path is None:
             raise RuntimeError(f"Segment {segment.index} did not produce an audio file")
-        if trim_silence:
-            leading_trim, trailing_trim = trim_audio_silence_in_place(
-                path=segment.audio_path,
-                silence_threshold_db=silence_threshold_db,
-                min_silence_duration=min_silence_duration,
-                keep_silence=keep_silence,
-            )
-            if leading_trim > 0 or trailing_trim > 0:
-                trimmed_segments += 1
-                total_leading_trim += leading_trim
-                total_trailing_trim += trailing_trim
         segment.synthetic_duration = ffprobe_duration(segment.audio_path)
-        if not trim_silence:
-            segment.leading_silence = 0.0
-            segment.trailing_silence = 0.0
-            continue
-        segment.leading_silence, segment.trailing_silence = detect_audio_edge_silence(
-            path=segment.audio_path,
-            silence_threshold_db=silence_threshold_db,
-            min_silence_duration=min_silence_duration,
-        )
-        segment.leading_silence = min(segment.leading_silence, segment.synthetic_duration)
-        max_trailing = max(0.0, segment.synthetic_duration - segment.leading_silence)
-        segment.trailing_silence = min(segment.trailing_silence, max_trailing)
-
-    return trimmed_segments, total_leading_trim, total_trailing_trim
-
-
-def trim_audio_silence_in_place(
-    path: Path,
-    silence_threshold_db: float,
-    min_silence_duration: float,
-    keep_silence: float,
-) -> tuple[float, float]:
-    total_leading_trim = 0.0
-    total_trailing_trim = 0.0
-
-    for _ in range(3):
-        leading_silence, trailing_silence = detect_audio_edge_silence(
-            path=path,
-            silence_threshold_db=silence_threshold_db,
-            min_silence_duration=min_silence_duration,
-        )
-        leading_trim = max(0.0, leading_silence - keep_silence)
-        trailing_trim = max(0.0, trailing_silence - keep_silence)
-        if leading_trim <= 0.0 and trailing_trim <= 0.0:
-            break
-
-        output_path = path.with_name(f"{path.stem}.trimmed{path.suffix}")
-        filter_chain = (
-            "silenceremove="
-            f"start_periods=1:start_duration={min_silence_duration:.3f}:"
-            f"start_threshold={silence_threshold_db}dB:start_silence={keep_silence:.3f},"
-            "areverse,"
-            "silenceremove="
-            f"start_periods=1:start_duration={min_silence_duration:.3f}:"
-            f"start_threshold={silence_threshold_db}dB:start_silence={keep_silence:.3f},"
-            "areverse"
-        )
-        cmd = [
-            resolve_tool_binary("ffmpeg"),
-            "-y",
-            "-loglevel",
-            "error",
-            "-i",
-            str(path),
-            "-af",
-            filter_chain,
-            *_audio_codec_args_for_path(path),
-            str(output_path),
-        ]
-        subprocess.run(cmd, check=True, text=True, capture_output=True)
-
-        try:
-            trimmed_duration = ffprobe_duration(output_path)
-        except (ValueError, subprocess.CalledProcessError):
-            output_path.unlink(missing_ok=True)
-            break
-        if trimmed_duration < 0.01:
-            output_path.unlink(missing_ok=True)
-            break
-
-        output_path.replace(path)
-        total_leading_trim += leading_trim
-        total_trailing_trim += trailing_trim
-
-    return total_leading_trim, total_trailing_trim
-
-
-def detect_audio_edge_silence(
-    path: Path,
-    silence_threshold_db: float,
-    min_silence_duration: float,
-) -> tuple[float, float]:
-    duration = ffprobe_duration(path)
-    completed = subprocess.run(
-        [
-            resolve_tool_binary("ffmpeg"),
-            "-hide_banner",
-            "-i",
-            str(path),
-            "-af",
-            f"silencedetect=noise={silence_threshold_db}dB:d={min_silence_duration:.3f}",
-            "-f",
-            "null",
-            "-",
-        ],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    output = completed.stderr
-
-    silence_starts: list[float] = []
-    silence_ends: list[float] = []
-    for line in output.splitlines():
-        if "silence_start:" in line:
-            silence_starts.append(float(line.split("silence_start:")[1].strip().split()[0]))
-        if "silence_end:" in line:
-            silence_ends.append(float(line.split("silence_end:")[1].split("|")[0].strip()))
-
-    leading_silence = 0.0
-    if silence_starts and silence_ends and abs(silence_starts[0]) < 0.001:
-        leading_silence = silence_ends[0]
-
-    trailing_silence = 0.0
-    if silence_starts:
-        last_start = silence_starts[-1]
-        last_end = silence_ends[-1] if silence_ends else -1.0
-        if silence_ends and abs(last_end - duration) < 0.02:
-            trailing_silence = max(0.0, duration - last_start)
-        elif last_start > last_end:
-            trailing_silence = max(0.0, duration - last_start)
-
-    return leading_silence, trailing_silence
+        segment.leading_silence = 0.0
+        segment.trailing_silence = 0.0
 
 
 def compose_dubbed_track(
@@ -247,20 +105,10 @@ def compose_dubbed_track(
             raise RuntimeError(f"Segment {segment.index} is missing synthesized duration")
         cmd.extend(["-i", str(segment.audio_path)])
         atempo = _build_atempo_chain(segment.playback_rate)
-        render_leading_silence = min(
-            max(0.0, segment.leading_silence / segment.playback_rate),
-            segment.render_start,
-        )
-        render_trailing_silence = min(
-            max(0.0, segment.trailing_silence / segment.playback_rate),
-            max(0.0, segment.render_duration - render_leading_silence - 0.01),
-        )
-        play_duration = max(0.01, segment.render_duration - render_trailing_silence)
-        delay_ms = int(max(0.0, segment.render_start - render_leading_silence) * 1000)
+        delay_ms = int(max(0.0, segment.render_start) * 1000)
         label = f"dub{input_index}"
         filters.append(
-            f"[{input_index}:a]{atempo},apad=pad_dur={play_duration:.3f},"
-            f"atrim=0:{play_duration:.3f},adelay={delay_ms}|{delay_ms},"
+            f"[{input_index}:a]{atempo},adelay={delay_ms}|{delay_ms},"
             f"volume={dub_volume}[{label}]"
         )
         dub_labels.append(f"[{label}]")
@@ -590,17 +438,6 @@ def _build_atempo_chain(factor: float) -> str:
         factor /= 2.0
     filters.append(f"atempo={factor:.6f}")
     return ",".join(filters)
-
-
-def _audio_codec_args_for_path(path: Path) -> list[str]:
-    suffix = path.suffix.lower()
-    if suffix == ".wav":
-        return ["-c:a", "pcm_s16le"]
-    if suffix == ".mp3":
-        return ["-c:a", "libmp3lame", "-q:a", "2"]
-    if suffix in {".m4a", ".aac"}:
-        return ["-c:a", "aac", "-b:a", "192k"]
-    return []
 
 
 def _build_video_codec_args(video_preset: str, video_crf: int) -> list[str]:

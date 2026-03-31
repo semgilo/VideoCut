@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
+import random
 import subprocess
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from videocut.models import VideoMetadata
 from videocut.publish import load_video_metadata
 from videocut.shell import run_command
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm")
@@ -26,6 +35,11 @@ YTDLP_PREFERRED_VIDEO_FORMAT = (
     "best[height<=1080]/"
     "best"
 )
+YTDLP_LOCK_PATH = Path(os.getenv("VIDEOCUT_YTDLP_LOCK_PATH", "/tmp/videocut-yt-dlp.lock"))
+YTDLP_RETRY_ATTEMPTS = max(1, int(os.getenv("VIDEOCUT_YTDLP_RETRY_ATTEMPTS", "3")))
+YTDLP_RETRY_BASE_SLEEP_SECONDS = max(1.0, float(os.getenv("VIDEOCUT_YTDLP_RETRY_BASE_SLEEP_SECONDS", "8")))
+YTDLP_REQUEST_SLEEP_SECONDS = max(0.0, float(os.getenv("VIDEOCUT_YTDLP_REQUEST_SLEEP_SECONDS", "2")))
+YTDLP_SUBTITLE_REQUEST_SLEEP_SECONDS = max(0.0, float(os.getenv("VIDEOCUT_YTDLP_SUBTITLE_REQUEST_SLEEP_SECONDS", "3")))
 
 
 @dataclass(slots=True)
@@ -46,52 +60,23 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
         return existing_download
 
     output_template = str(source_dir / "%(title).120B [%(id)s].%(ext)s")
-    run_command(
-        [
-            "yt-dlp",
-            "--no-playlist",
-            "--remote-components",
-            YTDLP_REMOTE_COMPONENTS,
-            "--write-subs",
-            "--write-auto-subs",
-            "--write-info-json",
-            "--write-thumbnail",
-            "--convert-thumbnails",
-            "jpg",
-            "--sub-langs",
-            "en.*,en",
-            "--convert-subs",
-            "vtt",
-            "-f",
-            YTDLP_PREFERRED_VIDEO_FORMAT,
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            output_template,
+
+    with _download_lock():
+        print("Acquired global yt-dlp download lock")
+        _download_video_with_retry(url, output_template)
+        _download_subtitles_best_effort(
             url,
-        ]
-    )
-    if include_chinese_subtitles:
-        try:
-            run_command(
-                [
-                    "yt-dlp",
-                    "--skip-download",
-                    "--remote-components",
-                    YTDLP_REMOTE_COMPONENTS,
-                    "--write-subs",
-                    "--write-auto-subs",
-                    "--sub-langs",
-                    "zh-Hans.*,zh-Hans,zh-CN.*,zh-CN,zh-Hant.*,zh-Hant",
-                    "--convert-subs",
-                    "vtt",
-                    "-o",
-                    output_template,
-                    url,
-                ]
+            output_template,
+            subtitle_langs="en,en-orig",
+            label="English",
+        )
+        if include_chinese_subtitles:
+            _download_subtitles_best_effort(
+                url,
+                output_template,
+                subtitle_langs="zh-Hans.*,zh-Hans,zh-CN.*,zh-CN,zh-Hant.*,zh-Hant",
+                label="Chinese",
             )
-        except subprocess.CalledProcessError as error:
-            print(f"Warning: could not download Chinese subtitle track, continuing without it: {error}")
 
     video_path = _pick_latest_video(source_dir)
     english_subtitle_path = _pick_best_subtitle(source_dir, video_path.stem, ("en", "en-orig"))
@@ -103,6 +88,12 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
     info_json_path = _pick_related_file(source_dir, video_path.stem, INFO_EXTENSIONS)
     thumbnail_path = _pick_related_file(source_dir, video_path.stem, THUMBNAIL_EXTENSIONS)
     source_metadata = load_video_metadata(info_json_path) if info_json_path is not None else None
+
+    if english_subtitle_path is None:
+        print("Warning: no English subtitle track was downloaded. Pipeline will fall back to Chinese track or ASR extraction.")
+    if include_chinese_subtitles and chinese_subtitle_path is None:
+        print("Warning: no Chinese subtitle track was downloaded. Continuing with translated subtitles or ASR fallback.")
+
     return DownloadResult(
         video_path=video_path,
         english_subtitle_path=english_subtitle_path,
@@ -111,6 +102,153 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
         thumbnail_path=thumbnail_path,
         source_metadata=source_metadata,
     )
+
+
+def _download_video_with_retry(url: str, output_template: str) -> None:
+    _run_ytdlp_with_retry(
+        [
+            "yt-dlp",
+            "--no-playlist",
+            "--remote-components",
+            YTDLP_REMOTE_COMPONENTS,
+            "--write-info-json",
+            "--write-thumbnail",
+            "--convert-thumbnails",
+            "jpg",
+            "--sleep-requests",
+            str(YTDLP_REQUEST_SLEEP_SECONDS),
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--extractor-retries",
+            "5",
+            "--file-access-retries",
+            "3",
+            "-f",
+            YTDLP_PREFERRED_VIDEO_FORMAT,
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            output_template,
+            url,
+        ],
+        label="video",
+        required=True,
+    )
+
+
+def _download_subtitles_best_effort(url: str, output_template: str, subtitle_langs: str, label: str) -> None:
+    try:
+        _run_ytdlp_with_retry(
+            [
+                "yt-dlp",
+                "--skip-download",
+                "--no-playlist",
+                "--remote-components",
+                YTDLP_REMOTE_COMPONENTS,
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs",
+                subtitle_langs,
+                "--convert-subs",
+                "vtt",
+                "--sleep-requests",
+                str(YTDLP_SUBTITLE_REQUEST_SLEEP_SECONDS),
+                "--retries",
+                "6",
+                "--fragment-retries",
+                "3",
+                "--extractor-retries",
+                "3",
+                "-o",
+                output_template,
+                url,
+            ],
+            label=f"{label.lower()} subtitles",
+            required=False,
+        )
+    except subprocess.CalledProcessError as error:
+        print(f"Warning: could not download {label} subtitle track, continuing without it: {error}")
+
+
+def _run_ytdlp_with_retry(args: list[str], label: str, required: bool) -> None:
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(1, YTDLP_RETRY_ATTEMPTS + 1):
+        try:
+            print(f"Starting yt-dlp {label} attempt {attempt}/{YTDLP_RETRY_ATTEMPTS}")
+            run_command(args)
+            return
+        except subprocess.CalledProcessError as error:
+            last_error = error
+            retryable = _should_retry_ytdlp(error)
+            if attempt >= YTDLP_RETRY_ATTEMPTS or not retryable:
+                if required:
+                    raise
+                raise error
+            sleep_seconds = _compute_retry_sleep_seconds(attempt)
+            print(
+                f"Warning: yt-dlp {label} attempt {attempt} failed ({_summarize_ytdlp_error(error)}). "
+                f"Retrying in {sleep_seconds:.1f}s..."
+            )
+            time.sleep(sleep_seconds)
+    if last_error is not None:
+        raise last_error
+
+
+def _should_retry_ytdlp(error: subprocess.CalledProcessError) -> bool:
+    output = _error_output_text(error).lower()
+    retry_markers = (
+        "429",
+        "too many requests",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "temporarily unavailable",
+        "http error 5",
+        "requested format is not available",
+        "unable to download api page",
+        "remote end closed connection",
+        "try again",
+        "rate limit",
+    )
+    return any(marker in output for marker in retry_markers) or error.returncode != 0
+
+
+def _compute_retry_sleep_seconds(attempt: int) -> float:
+    base = YTDLP_RETRY_BASE_SLEEP_SECONDS * (2 ** max(0, attempt - 1))
+    jitter = random.uniform(0, min(5.0, base * 0.25))
+    return base + jitter
+
+
+def _summarize_ytdlp_error(error: subprocess.CalledProcessError) -> str:
+    output = _error_output_text(error).strip()
+    if not output:
+        return f"exit code {error.returncode}"
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1][:240] if lines else f"exit code {error.returncode}"
+
+
+def _error_output_text(error: subprocess.CalledProcessError) -> str:
+    parts = []
+    if getattr(error, "stdout", None):
+        parts.append(str(error.stdout))
+    if getattr(error, "stderr", None):
+        parts.append(str(error.stderr))
+    return "\n".join(parts)
+
+
+@contextmanager
+def _download_lock():
+    YTDLP_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(YTDLP_LOCK_PATH, "w") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _load_existing_download(source_dir: Path) -> DownloadResult | None:

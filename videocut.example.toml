@@ -2,6 +2,7 @@
 mode = "subtitle_only"
 translation_backend = "llm"
 export_platform_materials = true
+cleanup_source_after_publish = true  # delete source/ (downloads) after publish; use --no-cleanup-source to keep
 output_name = "final_subtitled.mp4"
 runs_dir = "runs"
 

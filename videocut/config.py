@@ -26,68 +26,21 @@ def _default_cosyvoice_python() -> str:
 @dataclass(slots=True)
 class PipelineConfig:
     pipeline_mode: str = os.getenv("VIDEOCUT_PIPELINE_MODE", "dub")
-    translation_backend: str = os.getenv("VIDEOCUT_TRANSLATION_BACKEND", "auto")
     export_platform_materials: bool = os.getenv("VIDEOCUT_EXPORT_PLATFORM_MATERIALS", "1") != "0"
+    cleanup_source_after_publish: bool = os.getenv("VIDEOCUT_CLEANUP_SOURCE_AFTER_PUBLISH", "1") != "0"
 
-    llm_base_url: str = os.getenv("VIDEOCUT_LLM_BASE_URL", "https://api.openai.com/v1")
+    llm_base_url: str = os.getenv("VIDEOCUT_LLM_BASE_URL", "http://localhost:1234/v1")
     llm_api_key: str = os.getenv("VIDEOCUT_LLM_API_KEY", "")
     llm_model: str = os.getenv("VIDEOCUT_LLM_MODEL", "translategemma-4b-it-mlx-4bit")
     llm_timeout: int = int(os.getenv("VIDEOCUT_LLM_TIMEOUT", "120"))
-    translation_batch_size: int = int(os.getenv("VIDEOCUT_TRANSLATION_BATCH_SIZE", "25"))
+    translation_batch_size: int = int(os.getenv("VIDEOCUT_TRANSLATION_BATCH_SIZE", "10"))
     translation_concurrency: int = int(os.getenv("VIDEOCUT_TRANSLATION_CONCURRENCY", "1"))
-    translation_timing_adapt: bool = os.getenv("VIDEOCUT_TRANSLATION_TIMING_ADAPT", "0") != "0"
-    translation_target_compact_cps: float = float(
-        os.getenv("VIDEOCUT_TRANSLATION_TARGET_COMPACT_CPS", "4.6")
-    )
-    translation_adapt_slack_chars: int = int(
-        os.getenv("VIDEOCUT_TRANSLATION_ADAPT_SLACK_CHARS", "2")
-    )
-    translation_adapt_passes: int = int(
-        os.getenv("VIDEOCUT_TRANSLATION_ADAPT_PASSES", "2")
-    )
-    translation_adapt_min_chars: int = int(
-        os.getenv("VIDEOCUT_TRANSLATION_ADAPT_MIN_CHARS", "4")
-    )
-    translation_audio_repair: bool = os.getenv("VIDEOCUT_TRANSLATION_AUDIO_REPAIR", "1") != "0"
-    translation_audio_target_playback_rate: float = float(
-        os.getenv("VIDEOCUT_TRANSLATION_AUDIO_TARGET_PLAYBACK_RATE", "1.0")
-    )
-    translation_audio_repair_slack_seconds: float = float(
-        os.getenv("VIDEOCUT_TRANSLATION_AUDIO_REPAIR_SLACK_SECONDS", "0.05")
-    )
-    translation_audio_repair_passes: int = int(
-        os.getenv("VIDEOCUT_TRANSLATION_AUDIO_REPAIR_PASSES", "2")
-    )
-    translation_audio_repair_group_size: int = int(
-        os.getenv("VIDEOCUT_TRANSLATION_AUDIO_REPAIR_GROUP_SIZE", "1")
-    )
     protected_terms_path: str = os.getenv(
         "VIDEOCUT_PROTECTED_TERMS_PATH",
         str(_repo_root() / "translation_protected_terms.txt"),
     )
 
     tts_provider: str = os.getenv("VIDEOCUT_TTS_PROVIDER", "cosyvoice")
-    tts_voice: str = os.getenv("VIDEOCUT_TTS_VOICE", "zh-CN-XiaoxiaoNeural")
-    tts_rate: str = os.getenv("VIDEOCUT_TTS_RATE", "+0%")
-    tts_command: str = os.getenv("VIDEOCUT_TTS_COMMAND", "")
-    tts_command_audio_format: str = os.getenv("VIDEOCUT_TTS_COMMAND_AUDIO_FORMAT", "wav")
-    minimax_base_url: str = os.getenv("VIDEOCUT_MINIMAX_BASE_URL", "https://api.minimax.io")
-    minimax_api_key: str = os.getenv("VIDEOCUT_MINIMAX_API_KEY", "")
-    minimax_model: str = os.getenv("VIDEOCUT_MINIMAX_MODEL", "speech-2.8-turbo")
-    minimax_voice_id: str = os.getenv(
-        "VIDEOCUT_MINIMAX_VOICE_ID",
-        "Chinese (Mandarin)_News_Anchor",
-    )
-    minimax_speed: float = float(os.getenv("VIDEOCUT_MINIMAX_SPEED", "1.0"))
-    minimax_volume: float = float(os.getenv("VIDEOCUT_MINIMAX_VOLUME", "1.0"))
-    minimax_pitch: float = float(os.getenv("VIDEOCUT_MINIMAX_PITCH", "0"))
-    minimax_concurrency: int = int(os.getenv("VIDEOCUT_MINIMAX_CONCURRENCY", "4"))
-    minimax_audio_format: str = os.getenv("VIDEOCUT_MINIMAX_AUDIO_FORMAT", "mp3")
-    minimax_sample_rate: int = int(os.getenv("VIDEOCUT_MINIMAX_SAMPLE_RATE", "32000"))
-    minimax_bitrate: int = int(os.getenv("VIDEOCUT_MINIMAX_BITRATE", "128000"))
-    minimax_language_boost: str = os.getenv("VIDEOCUT_MINIMAX_LANGUAGE_BOOST", "Chinese")
-    minimax_voice_clone: bool = os.getenv("VIDEOCUT_MINIMAX_VOICE_CLONE", "0") != "0"
-    minimax_timeout: int = int(os.getenv("VIDEOCUT_MINIMAX_TIMEOUT", "180"))
     cosyvoice_python: str = os.getenv("VIDEOCUT_COSYVOICE_PYTHON", _default_cosyvoice_python())
     cosyvoice_repo_dir: str = os.getenv("VIDEOCUT_COSYVOICE_REPO_DIR", "")
     cosyvoice_model_dir: str = os.getenv("VIDEOCUT_COSYVOICE_MODEL_DIR", "")
@@ -98,17 +51,12 @@ class PipelineConfig:
 
     dub_audio_volume: float = float(os.getenv("VIDEOCUT_DUB_AUDIO_VOLUME", "1.0"))
     original_audio_volume: float = float(os.getenv("VIDEOCUT_ORIGINAL_AUDIO_VOLUME", "0.0"))
-    timing_mode: str = os.getenv("VIDEOCUT_TIMING_MODE", "natural")
-    min_playback_rate: float = float(os.getenv("VIDEOCUT_MIN_PLAYBACK_RATE", "0.6"))
-    max_playback_rate: float = float(os.getenv("VIDEOCUT_MAX_PLAYBACK_RATE", "1.18"))
-    max_segment_lag: float = float(os.getenv("VIDEOCUT_MAX_SEGMENT_LAG", "0.8"))
-    min_segment_gap: float = float(os.getenv("VIDEOCUT_MIN_SEGMENT_GAP", "0.05"))
-    max_opening_silence: float = float(os.getenv("VIDEOCUT_MAX_OPENING_SILENCE", "0.35"))
-    max_global_shift: float = float(os.getenv("VIDEOCUT_MAX_GLOBAL_SHIFT", "2.5"))
-    trim_tts_silence: bool = os.getenv("VIDEOCUT_TRIM_TTS_SILENCE", "1") != "0"
-    tts_silence_threshold_db: float = float(os.getenv("VIDEOCUT_TTS_SILENCE_THRESHOLD_DB", "-35"))
-    tts_silence_min_duration: float = float(os.getenv("VIDEOCUT_TTS_SILENCE_MIN_DURATION", "0.05"))
-    tts_keep_silence: float = float(os.getenv("VIDEOCUT_TTS_KEEP_SILENCE", "0.02"))
+
+    # Playback rate range for fitting dubbed audio into the subtitle slot.
+    # Natural speed (1.0) is always preferred; audio is sped up only when
+    # synthetic_duration > slot_duration, capped at max_playback_rate.
+    # Segments that still overflow at max rate are trimmed (no overlap).
+    max_playback_rate: float = float(os.getenv("VIDEOCUT_MAX_PLAYBACK_RATE", "1.3"))
 
     burn_subtitles: bool = os.getenv("VIDEOCUT_BURN_SUBTITLES", "1") != "0"
     subtitle_font: str = os.getenv("VIDEOCUT_SUBTITLE_FONT", "Arial Unicode MS")
@@ -131,8 +79,8 @@ DEFAULT_CONFIG_PATH = Path("videocut.toml")
 _SECTION_FIELD_MAP: dict[str, dict[str, str]] = {
     "pipeline": {
         "mode": "pipeline_mode",
-        "translation_backend": "translation_backend",
         "export_platform_materials": "export_platform_materials",
+        "cleanup_source_after_publish": "cleanup_source_after_publish",
         "output_name": "output_name",
         "runs_dir": "runs_dir",
     },
@@ -143,40 +91,10 @@ _SECTION_FIELD_MAP: dict[str, dict[str, str]] = {
         "llm_timeout": "llm_timeout",
         "batch_size": "translation_batch_size",
         "concurrency": "translation_concurrency",
-        "timing_adapt": "translation_timing_adapt",
-        "target_compact_cps": "translation_target_compact_cps",
-        "adapt_slack_chars": "translation_adapt_slack_chars",
-        "adapt_passes": "translation_adapt_passes",
-        "adapt_min_chars": "translation_adapt_min_chars",
-        "audio_repair": "translation_audio_repair",
-        "audio_target_playback_rate": "translation_audio_target_playback_rate",
-        "audio_repair_slack_seconds": "translation_audio_repair_slack_seconds",
-        "audio_repair_passes": "translation_audio_repair_passes",
-        "audio_repair_group_size": "translation_audio_repair_group_size",
         "protected_terms_path": "protected_terms_path",
     },
     "tts": {
         "provider": "tts_provider",
-        "voice": "tts_voice",
-        "rate": "tts_rate",
-        "command": "tts_command",
-        "command_audio_format": "tts_command_audio_format",
-    },
-    "minimax": {
-        "base_url": "minimax_base_url",
-        "api_key": "minimax_api_key",
-        "model": "minimax_model",
-        "voice_id": "minimax_voice_id",
-        "speed": "minimax_speed",
-        "volume": "minimax_volume",
-        "pitch": "minimax_pitch",
-        "concurrency": "minimax_concurrency",
-        "audio_format": "minimax_audio_format",
-        "sample_rate": "minimax_sample_rate",
-        "bitrate": "minimax_bitrate",
-        "language_boost": "minimax_language_boost",
-        "voice_clone": "minimax_voice_clone",
-        "timeout": "minimax_timeout",
     },
     "cosyvoice": {
         "python": "cosyvoice_python",
@@ -190,19 +108,7 @@ _SECTION_FIELD_MAP: dict[str, dict[str, str]] = {
     "audio": {
         "dub_volume": "dub_audio_volume",
         "original_volume": "original_audio_volume",
-    },
-    "timing": {
-        "mode": "timing_mode",
-        "min_playback_rate": "min_playback_rate",
         "max_playback_rate": "max_playback_rate",
-        "max_segment_lag": "max_segment_lag",
-        "min_segment_gap": "min_segment_gap",
-        "max_opening_silence": "max_opening_silence",
-        "max_global_shift": "max_global_shift",
-        "trim_tts_silence": "trim_tts_silence",
-        "tts_silence_threshold_db": "tts_silence_threshold_db",
-        "tts_silence_min_duration": "tts_silence_min_duration",
-        "tts_keep_silence": "tts_keep_silence",
     },
     "subtitles": {
         "burn": "burn_subtitles",
