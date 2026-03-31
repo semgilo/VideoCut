@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-04-01
+
+### Changed
+- Unified the production path into one fixed pipeline: download -> subtitle parse -> local LLM translation -> CosyVoice TTS -> duration measure -> stretch/compress alignment -> bilingual SRT -> dub mix -> final render -> publish assets.
+- Removed runtime fallbacks for ASR/chinese-track reuse from the main pipeline and made English subtitles + local LLM translation explicit requirements.
+- Simplified config/CLI surface to unified-flow fields only and updated default TOML/ENV templates accordingly.
+- Updated subtitle-budget calculation to `L/V` form via `target_cps=4.5` with `char_tolerance=0.2` (±20%).
+- Switched timing planner behavior to strict boundary alignment with exact per-segment rate (`synthetic_duration / subtitle_duration`) without trim/crop retries.
+
+### Added
+- Added `USAGE.zh-CN.md` as the unified usage manual.
+
 ## 2026-03-22
 
 ### Added

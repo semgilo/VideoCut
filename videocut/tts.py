@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from videocut.config import PipelineConfig
@@ -76,22 +77,36 @@ def _synthesize_segments_with_cosyvoice(
         config.cosyvoice_mode,
         "--prompt-audio",
         str(prompt_audio_path),
-        "--input-json",
-        str(manifest_path),
     ]
     if prompt_text:
         cmd.extend(["--prompt-text", prompt_text])
+    worker_count = max(1, min(config.cosyvoice_concurrency, len(input_manifest)))
     print(
         "Synthesizing Chinese dubbing with CosyVoice "
         f"({config.cosyvoice_mode}, {len(pending_segments)} new / {len(segments)} total segments, "
-        f"group size {group_size})..."
+        f"group size {group_size}, workers {worker_count})..."
     )
-    run_command(
-        cmd,
-        env={
-            "PYTORCH_ENABLE_MPS_FALLBACK": "1",
-        },
-    )
+    if worker_count == 1:
+        _run_cosyvoice_batch(cmd=cmd, input_json_path=manifest_path)
+        return
+
+    shard_paths: list[Path] = []
+    for worker_index, shard_jobs in enumerate(_split_jobs_for_workers(input_manifest, worker_count), start=1):
+        shard_path = output_dir / f"cosyvoice_inputs.worker{worker_index:02d}.json"
+        shard_path.write_text(json.dumps(shard_jobs, ensure_ascii=False, indent=2), encoding="utf-8")
+        shard_paths.append(shard_path)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(
+                _run_cosyvoice_batch,
+                cmd,
+                shard_path,
+            )
+            for shard_path in shard_paths
+        ]
+        for future in futures:
+            future.result()
 
 
 def _build_cosyvoice_input_manifest(
@@ -130,6 +145,25 @@ def _build_cosyvoice_input_manifest(
 
 def _chunked_segments(segments: list[Segment], size: int) -> list[list[Segment]]:
     return [segments[index : index + size] for index in range(0, len(segments), size)]
+
+
+def _split_jobs_for_workers(jobs: list[dict[str, object]], workers: int) -> list[list[dict[str, object]]]:
+    if workers <= 1 or len(jobs) <= 1:
+        return [jobs]
+    chunk_size = max(1, (len(jobs) + workers - 1) // workers)
+    return [jobs[index : index + chunk_size] for index in range(0, len(jobs), chunk_size)]
+
+
+def _run_cosyvoice_batch(
+    cmd: list[str],
+    input_json_path: Path,
+) -> None:
+    run_command(
+        [*cmd, "--input-json", str(input_json_path)],
+        env={
+            "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+        },
+    )
 
 
 def _combine_grouped_cosyvoice_text(segments: list[Segment]) -> str:

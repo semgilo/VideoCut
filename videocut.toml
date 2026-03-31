@@ -1,8 +1,7 @@
 [pipeline]
-mode = "subtitle_only"
-translation_backend = "auto"
 export_platform_materials = true
-output_name = "final_subtitled.mp4"
+cleanup_source_after_publish = true
+output_name = "final_cn.mp4"
 runs_dir = "runs"
 
 [translation]
@@ -12,66 +11,23 @@ llm_model = "translategemma-4b-it-mlx-4bit"
 llm_timeout = 120
 batch_size = 10
 concurrency = 4
-timing_adapt = false
-target_compact_cps = 4.6
-adapt_slack_chars = 2
-adapt_passes = 2
-adapt_min_chars = 4
-audio_repair = false
-audio_target_playback_rate = 1.0
-audio_repair_slack_seconds = 0.05
-audio_repair_passes = 2
-audio_repair_group_size = 1
+target_cps = 4.5
+char_tolerance = 0.2
 protected_terms_path = "translation_protected_terms.txt"
-
-[tts]
-provider = "cosyvoice"
-voice = "zh-CN-XiaoxiaoNeural"
-rate = "+0%"
-command = ""
-command_audio_format = "wav"
-
-[minimax]
-base_url = "https://api.minimax.io"
-api_key = ""
-model = "speech-2.8-turbo"
-voice_id = "Chinese (Mandarin)_News_Anchor"
-speed = 1.0
-volume = 1.0
-pitch = 0.0
-concurrency = 4
-audio_format = "mp3"
-sample_rate = 32000
-bitrate = 128000
-language_boost = "Chinese"
-voice_clone = false
-timeout = 180
 
 [cosyvoice]
 python = "./.venv-cosyvoice/bin/python"
 repo_dir = ".vendor/CosyVoice"
 model_dir = ".vendor/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B"
 mode = "cross_lingual"
-group_size = 1
+group_size = 3
+concurrency = 2
 reference_audio_path = ""
 reference_text = ""
 
 [audio]
-original_volume = 1.0
+original_volume = 0.0
 dub_volume = 1.0
-
-[timing]
-mode = "natural"
-min_playback_rate = 0.6
-max_playback_rate = 1.18
-max_segment_lag = 0.8
-min_segment_gap = 0.05
-max_opening_silence = 0.35
-max_global_shift = 2.5
-trim_tts_silence = true
-tts_silence_threshold_db = -35.0
-tts_silence_min_duration = 0.05
-tts_keep_silence = 0.02
 
 [subtitles]
 burn = true
@@ -83,8 +39,3 @@ overlay_concurrency = 4
 [video]
 preset = "medium"
 crf = 20
-
-[asr]
-model = "small"
-device = "auto"
-compute_type = "int8"

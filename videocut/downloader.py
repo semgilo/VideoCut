@@ -90,9 +90,9 @@ def download_youtube_assets(url: str, source_dir: Path, include_chinese_subtitle
     source_metadata = load_video_metadata(info_json_path) if info_json_path is not None else None
 
     if english_subtitle_path is None:
-        print("Warning: no English subtitle track was downloaded. Pipeline will fall back to Chinese track or ASR extraction.")
+        print("Warning: no English subtitle track was downloaded.")
     if include_chinese_subtitles and chinese_subtitle_path is None:
-        print("Warning: no Chinese subtitle track was downloaded. Continuing with translated subtitles or ASR fallback.")
+        print("Warning: no Chinese subtitle track was downloaded.")
 
     return DownloadResult(
         video_path=video_path,

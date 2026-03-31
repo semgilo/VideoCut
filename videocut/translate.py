@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import socket
 import time
@@ -8,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import urlparse
+import unicodedata
 
 import requests
 
@@ -27,6 +29,13 @@ class OpenAICompatibleTranslator:
         timeout: int,
         batch_size: int,
         concurrency: int = 1,
+        target_cps: float = 4.5,
+        char_tolerance: float = 0.2,
+        # Legacy options kept for backward compatibility with old scripts.
+        min_playback_rate: float | None = None,
+        max_playback_rate: float | None = None,
+        enforce_char_budget: bool = False,
+        budget_refine_passes: int = 1,
         protected_terms: list[str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -35,6 +44,15 @@ class OpenAICompatibleTranslator:
         self.timeout = timeout
         self.batch_size = batch_size
         self.concurrency = max(1, concurrency)
+        self.target_cps = max(1.0, target_cps)
+        self.char_tolerance = min(max(0.0, char_tolerance), 0.95)
+        if min_playback_rate is not None or max_playback_rate is not None:
+            legacy_min = 0.8 if min_playback_rate is None else min_playback_rate
+            legacy_max = 1.2 if max_playback_rate is None else max_playback_rate
+            legacy_tolerance = max(abs(1.0 - legacy_min), abs(legacy_max - 1.0))
+            self.char_tolerance = min(max(self.char_tolerance, legacy_tolerance), 0.95)
+        self.enforce_char_budget = enforce_char_budget
+        self.budget_refine_passes = max(1, budget_refine_passes)
         self.protected_terms = _dedupe_terms(protected_terms or [])
 
     def translate(self, segments: list[Segment]) -> None:
@@ -57,15 +75,22 @@ class OpenAICompatibleTranslator:
 
 
     def _translate_batch(self, batch: list[Segment]) -> list[dict[str, str | int]]:
-        payload_segments = [
-            {
-                "id": segment.index,
-                "text": segment.english,
-                "duration": round(segment.duration, 2),
-                "budget": max(4, int(segment.duration * 4.5)),
-            }
-            for segment in batch
-        ]
+        payload_segments = []
+        for segment in batch:
+            min_budget, max_budget = _subtitle_char_budget(
+                duration=segment.duration,
+                target_cps=self.target_cps,
+                char_tolerance=self.char_tolerance,
+            )
+            payload_segments.append(
+                {
+                    "id": segment.index,
+                    "text": segment.english,
+                    "duration": round(segment.duration, 2),
+                    "min_budget": min_budget,
+                    "max_budget": max_budget,
+                }
+            )
         masked_segments, required_placeholders, placeholder_to_term = _mask_segment_payload(
             payload_segments,
             self.protected_terms,
@@ -74,10 +99,11 @@ class OpenAICompatibleTranslator:
             "You are a subtitle translator for dubbing. Translate English subtitles into concise, "
             "spoken Simplified Chinese that sounds natural aloud. Prefer shorter phrasing over literal "
             "translation when the meaning stays intact. Keep names, product terms, and numbers accurate. "
-            "Each subtitle has a 'duration' field (seconds) and 'budget' field (max Chinese characters). "
-            "The translation MUST fit within the duration: aim for AT MOST 'budget' Chinese characters "
-            "(excluding spaces and punctuation). Natural Chinese speech is ~4.5 characters/second. "
-            "If the source text is too long, use concise paraphrasing to stay within budget. "
+            "Each subtitle has 'min_budget' and 'max_budget' fields, which define the allowed Chinese "
+            "character range (excluding spaces and punctuation). "
+            "The translation MUST stay within that range: not shorter than min_budget and not longer "
+            "than max_budget. If the source text is too long, paraphrase concisely. If it is too short, "
+            "rewrite naturally without adding unrelated facts. "
             "If placeholder tokens like [[VC_TERM_0001]] appear, copy them exactly and do not translate, "
             "remove, or rename them. "
             "Avoid adding filler words or explanations that were not in the source. "
@@ -85,7 +111,7 @@ class OpenAICompatibleTranslator:
         )
         user_prompt = (
             "Translate each subtitle item to Simplified Chinese. Preserve the ids exactly. "
-            "Respect the duration and budget constraints for each item. "
+            "Respect the min_budget/max_budget character constraints for each item. "
             "If any [[VC_TERM_xxxx]] token appears, keep it unchanged in the output.\n"
             f"{json.dumps(masked_segments, ensure_ascii=False)}"
         )
@@ -157,14 +183,25 @@ class OpenAICompatibleTranslator:
         total_segments = len(segments)
         if self.concurrency <= 1 or len(segments) <= 1:
             for translated_count, segment in enumerate(segments, start=1):
-                segment.chinese = _translate_completion_text(
+                translated = _translate_completion_text(
                     translator=self,
                     text=segment.english,
-                    prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(t, p, s, d),
+                    prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(
+                        t,
+                        p,
+                        s,
+                        d,
+                        self.target_cps,
+                        self.char_tolerance,
+                    ),
                     term_to_placeholder=term_to_placeholder,
                     placeholder_to_term=placeholder_to_term,
                     max_tokens=_completion_max_tokens(segment.english, minimum=96, maximum=220),
                     empty_error_label=f"segment {segment.index}",
+                )
+                segment.chinese = self._fit_translation_to_budget(
+                    segment=segment,
+                    translated_text=translated,
                 )
                 print(f"Translated {translated_count}/{total_segments} segments")
             return
@@ -174,7 +211,14 @@ class OpenAICompatibleTranslator:
                     _translate_completion_text,
                     translator=self,
                     text=segment.english,
-                    prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(t, p, s, d),
+                    prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(
+                        t,
+                        p,
+                        s,
+                        d,
+                        self.target_cps,
+                        self.char_tolerance,
+                    ),
                     term_to_placeholder=term_to_placeholder,
                     placeholder_to_term=placeholder_to_term,
                     max_tokens=_completion_max_tokens(segment.english, minimum=96, maximum=220),
@@ -185,7 +229,10 @@ class OpenAICompatibleTranslator:
             translated_count = 0
             for future in as_completed(future_to_segment):
                 segment = future_to_segment[future]
-                segment.chinese = future.result()
+                segment.chinese = self._fit_translation_to_budget(
+                    segment=segment,
+                    translated_text=future.result(),
+                )
                 translated_count += 1
                 print(f"Translated {translated_count}/{total_segments} segments")
 
@@ -235,7 +282,11 @@ class OpenAICompatibleTranslator:
             if missing_ids:
                 raise RuntimeError(f"Translator response is missing ids: {missing_ids}")
             for segment in batch:
-                segment.chinese = mapping[segment.index]
+                translated = mapping[segment.index]
+                segment.chinese = self._fit_translation_to_budget(
+                    segment=segment,
+                    translated_text=translated,
+                )
             return len(batch)
         except (requests.RequestException, RuntimeError, ValueError) as error:
             if len(batch) == 1:
@@ -248,6 +299,70 @@ class OpenAICompatibleTranslator:
             return self._translate_batch_resilient(batch[:midpoint]) + self._translate_batch_resilient(
                 batch[midpoint:]
             )
+
+    def _fit_translation_to_budget(self, segment: Segment, translated_text: str) -> str:
+        min_budget, max_budget = _subtitle_char_budget(
+            duration=segment.duration,
+            target_cps=self.target_cps,
+            char_tolerance=self.char_tolerance,
+        )
+        candidate = translated_text.strip()
+        char_count = _count_spoken_characters(candidate)
+        if min_budget <= char_count <= max_budget:
+            return candidate
+        print(
+            f"Warning: segment {segment.index} translated length {char_count} is outside "
+            f"[{min_budget}, {max_budget}]. Keeping single-pass translation output."
+        )
+        return candidate
+
+    def _rewrite_translation_to_budget(
+        self,
+        segment: Segment,
+        current_translation: str,
+        min_budget: int,
+        max_budget: int,
+    ) -> str:
+        term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
+        masked_english, placeholders = _mask_text(segment.english, term_to_placeholder)
+        masked_current, _ = _mask_text(current_translation, term_to_placeholder)
+
+        if _requires_completion_api(self.model):
+            prompt = (
+                "Rewrite the Chinese subtitle so it sounds natural when spoken and preserves meaning. "
+                f"Chinese character count (excluding spaces and punctuation) must be between {min_budget} "
+                f"and {max_budget}. {_placeholder_instruction(placeholders, True)} "
+                "Return only the rewritten Chinese subtitle. No explanation.\n\n"
+                f"English: {masked_english}\n"
+                f"Current Chinese: {masked_current}\n"
+                "Rewritten Chinese:"
+            )
+            completion = self._complete_text(
+                prompt=prompt,
+                max_tokens=_completion_max_tokens(segment.english, minimum=96, maximum=240),
+            )
+            rewritten = _clean_completion_translation(completion)
+        else:
+            system_prompt = (
+                "You rewrite Chinese dubbing subtitles. Keep meaning accurate and spoken style natural. "
+                f"Output Chinese text only. Character count (excluding spaces and punctuation) must be "
+                f"between {min_budget} and {max_budget}. "
+                f"{_placeholder_instruction(placeholders, True)} "
+                'Return JSON only: {"text":"..."}'
+            )
+            user_prompt = (
+                "Rewrite this subtitle with strict length bounds.\n"
+                f'{{"english":{json.dumps(masked_english, ensure_ascii=False)},'
+                f'"current":{json.dumps(masked_current, ensure_ascii=False)},'
+                f'"min_budget":{min_budget},"max_budget":{max_budget}}}'
+            )
+            parsed = self._complete_json(system_prompt, user_prompt)
+            rewritten = str(parsed.get("text", "")).strip()
+
+        if not rewritten:
+            raise RuntimeError(f"Budget rewrite returned empty text for segment {segment.index}")
+        restored = _restore_masked_text(rewritten, placeholders, placeholder_to_term)
+        return restored
 
     def _complete_json(self, system_prompt: str, user_prompt: str) -> dict:
         if _is_ollama_base_url(self.base_url):
@@ -517,7 +632,10 @@ def _mask_segment_payload(
     for item in payload_segments:
         segment_id = int(item["id"])
         masked_text, placeholders = _mask_text(str(item["text"]), term_to_placeholder)
-        masked_segments.append({"id": segment_id, "text": masked_text})
+        masked_item = dict(item)
+        masked_item["id"] = segment_id
+        masked_item["text"] = masked_text
+        masked_segments.append(masked_item)
         required_placeholders[segment_id] = placeholders
     return masked_segments, required_placeholders, placeholder_to_term
 
@@ -639,10 +757,22 @@ def _normalize_placeholder_variants(
     return PLACEHOLDER_VARIANT_RE.sub(replacer, text), unknown_tokens
 
 
-def _subtitle_completion_prompt(text: str, placeholders: list[str], strict: bool, duration: float = 0.0) -> str:
-    char_budget = max(4, int(duration * 4.5))
+def _subtitle_completion_prompt(
+    text: str,
+    placeholders: list[str],
+    strict: bool,
+    duration: float = 0.0,
+    target_cps: float = 4.5,
+    char_tolerance: float = 0.2,
+) -> str:
+    min_budget, max_budget = _subtitle_char_budget(
+        duration=duration,
+        target_cps=target_cps,
+        char_tolerance=char_tolerance,
+    )
     budget_hint = (
-        f"Target duration: {duration:.1f}s, aim for at most {char_budget} Chinese characters. "
+        f"Target duration: {duration:.1f}s. Chinese character count (excluding spaces and punctuation) "
+        f"must be between {min_budget} and {max_budget}. "
     ) if duration > 0 else ""
     return (
         "Translate the following English subtitle into concise spoken Simplified Chinese. "
@@ -672,6 +802,31 @@ def _metadata_completion_prompt(
 def _completion_max_tokens(text: str, minimum: int, maximum: int) -> int:
     estimated = len(text) * 2 + 24
     return max(minimum, min(maximum, estimated))
+
+
+def _subtitle_char_budget(
+    duration: float,
+    target_cps: float,
+    char_tolerance: float,
+) -> tuple[int, int]:
+    slot_duration = max(0.01, duration)
+    cps = max(1.0, target_cps)
+    base = slot_duration * cps
+    tolerance = min(max(0.0, char_tolerance), 0.95)
+    min_budget = max(2, int(math.floor(base * (1.0 - tolerance))))
+    max_budget = max(min_budget, int(math.ceil(base * (1.0 + tolerance))))
+    return min_budget, max_budget
+
+
+def _count_spoken_characters(text: str) -> int:
+    count = 0
+    for char in text:
+        if char.isspace():
+            continue
+        if unicodedata.category(char).startswith("P"):
+            continue
+        count += 1
+    return count
 
 
 def _placeholder_instruction(placeholders: list[str], strict: bool) -> str:
