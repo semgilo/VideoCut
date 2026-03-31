@@ -71,9 +71,34 @@ python -m videocut.cli run "https://www.youtube.com/watch?v=VIDEO_ID" \
 - `platforms/` 平台发布资产（标题、描述、标签、封面等）
 
 ## 7. 性能建议
-- 翻译吞吐：调高 `translation.concurrency`
-- CosyVoice 吞吐：调高 `cosyvoice.concurrency`
-- CosyVoice 每任务句长：用 `cosyvoice.group_size` 控制
+- 翻译（本地 LLM）：
+  - `TranslateGemma`（completion 路径）优先调 `translation.concurrency`；`batch_size` 对吞吐影响较小
+  - 兼容 JSON 批量输出的 chat 模型可同时提高 `translation.batch_size` 与 `translation.concurrency`
+  - 16G 机器建议先从并发 `4` 起步，通常 `4~6` 比 `8+` 更稳
+- CosyVoice：
+  - 16G 内存建议 `cosyvoice.concurrency=1~2`，若出现 `MPS fallback` 或长时间卡住，固定为 `1`
+  - 用 `cosyvoice.group_size=3~5` 降低单句调度开销（越大吞吐越高，但分句精细度会下降）
+- 渲染：
+  - 速度优先可将 `video.preset` 从 `medium` 调到 `veryfast`
+  - 若允许软字幕，设 `subtitles.burn=false` 可显著减少最终编码时间
+
+推荐的 16G「速度优先」配置示例：
+```toml
+[translation]
+batch_size = 10
+concurrency = 4
+
+[cosyvoice]
+group_size = 4
+concurrency = 1
+
+[subtitles]
+burn = true
+
+[video]
+preset = "veryfast"
+crf = 21
+```
 
 ## 8. 注意事项
 - 该统一流程要求能拿到英文字幕；若视频无英文字幕会报错。

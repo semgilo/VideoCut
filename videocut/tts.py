@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from videocut.config import PipelineConfig
-from videocut.media import ffprobe_duration
 from videocut.models import Segment
 from videocut.shell import run_command
 
@@ -105,7 +104,7 @@ def _synthesize_segments_with_cosyvoice(
             )
             for shard_path in shard_paths
         ]
-        for future in futures:
+        for future in as_completed(futures):
             future.result()
 
 

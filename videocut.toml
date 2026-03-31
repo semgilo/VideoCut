@@ -20,8 +20,8 @@ python = "./.venv-cosyvoice/bin/python"
 repo_dir = ".vendor/CosyVoice"
 model_dir = ".vendor/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B"
 mode = "cross_lingual"
-group_size = 3
-concurrency = 2
+group_size = 4
+concurrency = 1
 reference_audio_path = ""
 reference_text = ""
 
@@ -37,5 +37,5 @@ font_size = 18
 overlay_concurrency = 4
 
 [video]
-preset = "medium"
-crf = 20
+preset = "veryfast"
+crf = 21

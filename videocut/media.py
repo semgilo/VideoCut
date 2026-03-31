@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import wave
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,12 +72,28 @@ def ffprobe_video_size(path: Path) -> tuple[int, int]:
 
 def measure_synthesized_segments(segments: list[Segment]) -> None:
     """Measure and store synthetic_duration for each segment after CosyVoice synthesis."""
+    if not segments:
+        return
     for segment in segments:
         if segment.audio_path is None:
             raise RuntimeError(f"Segment {segment.index} did not produce an audio file")
-        segment.synthetic_duration = ffprobe_duration(segment.audio_path)
-        segment.leading_silence = 0.0
-        segment.trailing_silence = 0.0
+    max_workers = min(8, len(segments))
+    if max_workers <= 1:
+        for segment in segments:
+            segment.synthetic_duration = ffprobe_duration(segment.audio_path)
+            segment.leading_silence = 0.0
+            segment.trailing_silence = 0.0
+        return
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_segment = {
+            executor.submit(ffprobe_duration, segment.audio_path): segment
+            for segment in segments
+        }
+        for future in as_completed(future_to_segment):
+            segment = future_to_segment[future]
+            segment.synthetic_duration = future.result()
+            segment.leading_silence = 0.0
+            segment.trailing_silence = 0.0
 
 
 def compose_dubbed_track(

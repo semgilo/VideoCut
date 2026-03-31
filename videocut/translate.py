@@ -16,7 +16,6 @@ import requests
 from videocut.models import Segment, VideoMetadata
 
 
-JSON_RE = re.compile(r"\{.*\}", re.S)
 PROTECTED_PLACEHOLDER_TEMPLATE = "[[VC_TERM_{index:04d}]]"
 PLACEHOLDER_VARIANT_RE = re.compile(r"\[\[?VC_TERM_(?P<id>\d{1,4}|xxxx)\]?\]?", re.IGNORECASE)
 
@@ -179,51 +178,39 @@ class OpenAICompatibleTranslator:
             upload_date=metadata.upload_date,
         )
     def _translate_with_completion_model(self, segments: list[Segment]) -> None:
-        term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
+        if not segments:
+            return
+        use_batch_mode = self.batch_size > 1 and _supports_completion_batch_mode(self.model)
+        if not use_batch_mode:
+            self._translate_completion_segments_individually(segments)
+            return
+        batches = list(_batched(segments, self.batch_size))
+        translated_count = 0
+        total_segments = len(segments)
+        if self.concurrency <= 1 or len(batches) <= 1:
+            for batch in batches:
+                translated_count += self._translate_completion_batch_resilient(batch)
+                print(f"Translated {translated_count}/{total_segments} segments")
+            return
+        with ThreadPoolExecutor(max_workers=min(self.concurrency, len(batches))) as executor:
+            futures = [executor.submit(self._translate_completion_batch_resilient, batch) for batch in batches]
+            for future in as_completed(futures):
+                translated_count += future.result()
+                print(f"Translated {translated_count}/{total_segments} segments")
+
+    def _translate_completion_segments_individually(self, segments: list[Segment]) -> None:
         total_segments = len(segments)
         if self.concurrency <= 1 or len(segments) <= 1:
             for translated_count, segment in enumerate(segments, start=1):
-                translated = _translate_completion_text(
-                    translator=self,
-                    text=segment.english,
-                    prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(
-                        t,
-                        p,
-                        s,
-                        d,
-                        self.target_cps,
-                        self.char_tolerance,
-                    ),
-                    term_to_placeholder=term_to_placeholder,
-                    placeholder_to_term=placeholder_to_term,
-                    max_tokens=_completion_max_tokens(segment.english, minimum=96, maximum=220),
-                    empty_error_label=f"segment {segment.index}",
-                )
                 segment.chinese = self._fit_translation_to_budget(
                     segment=segment,
-                    translated_text=translated,
+                    translated_text=self._translate_completion_single_segment(segment),
                 )
                 print(f"Translated {translated_count}/{total_segments} segments")
             return
         with ThreadPoolExecutor(max_workers=min(self.concurrency, len(segments))) as executor:
             future_to_segment = {
-                executor.submit(
-                    _translate_completion_text,
-                    translator=self,
-                    text=segment.english,
-                    prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(
-                        t,
-                        p,
-                        s,
-                        d,
-                        self.target_cps,
-                        self.char_tolerance,
-                    ),
-                    term_to_placeholder=term_to_placeholder,
-                    placeholder_to_term=placeholder_to_term,
-                    max_tokens=_completion_max_tokens(segment.english, minimum=96, maximum=220),
-                    empty_error_label=f"segment {segment.index}",
-                ): segment
+                executor.submit(self._translate_completion_single_segment, segment): segment
                 for segment in segments
             }
             translated_count = 0
@@ -235,6 +222,105 @@ class OpenAICompatibleTranslator:
                 )
                 translated_count += 1
                 print(f"Translated {translated_count}/{total_segments} segments")
+
+    def _translate_completion_batch(self, batch: list[Segment]) -> list[dict[str, str | int]]:
+        payload_segments = []
+        for segment in batch:
+            min_budget, max_budget = _subtitle_char_budget(
+                duration=segment.duration,
+                target_cps=self.target_cps,
+                char_tolerance=self.char_tolerance,
+            )
+            payload_segments.append(
+                {
+                    "id": segment.index,
+                    "text": segment.english,
+                    "duration": round(segment.duration, 2),
+                    "min_budget": min_budget,
+                    "max_budget": max_budget,
+                }
+            )
+        masked_segments, required_placeholders, placeholder_to_term = _mask_segment_payload(
+            payload_segments,
+            self.protected_terms,
+        )
+        prompt = (
+            "Translate each subtitle item into concise, spoken Simplified Chinese for dubbing. "
+            "Keep ids unchanged. Each item has min_budget and max_budget; Chinese character count "
+            "(excluding spaces and punctuation) must stay within that range. "
+            "If placeholder tokens like [[VC_TERM_0001]] appear, copy them exactly and do not "
+            "translate, remove, or rename them. "
+            "Return JSON only with this shape: "
+            '{"translations":[{"id":1,"text":"..."}]}.\n\n'
+            "Input JSON:\n"
+            f"{json.dumps(masked_segments, ensure_ascii=False)}\n\n"
+            "Output JSON:"
+        )
+        completion = self._complete_text(
+            prompt=prompt,
+            max_tokens=_completion_batch_max_tokens(batch),
+        )
+        parsed = _extract_json_object(completion)
+        translations = parsed.get("translations")
+        if not isinstance(translations, list):
+            raise RuntimeError(f"Unexpected completion translator payload: {parsed}")
+        return _restore_segment_translations(translations, required_placeholders, placeholder_to_term)
+
+    def _translate_completion_batch_resilient(self, batch: list[Segment]) -> int:
+        if len(batch) == 1:
+            segment = batch[0]
+            segment.chinese = self._fit_translation_to_budget(
+                segment=segment,
+                translated_text=self._translate_completion_single_segment(segment),
+            )
+            return 1
+        try:
+            translations = self._translate_completion_batch(batch)
+            mapping = {int(item["id"]): str(item["text"]).strip() for item in translations}
+            missing_ids = [segment.index for segment in batch if segment.index not in mapping]
+            if missing_ids:
+                raise RuntimeError(f"Completion translator response is missing ids: {missing_ids}")
+            for segment in batch:
+                translated = mapping[segment.index]
+                segment.chinese = self._fit_translation_to_budget(
+                    segment=segment,
+                    translated_text=translated,
+                )
+            return len(batch)
+        except (requests.RequestException, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
+            midpoint = len(batch) // 2
+            print(
+                f"Completion translation batch {batch[0].index}-{batch[-1].index} failed: {error}. "
+                "Retrying with smaller batches."
+            )
+            return self._translate_completion_batch_resilient(batch[:midpoint]) + self._translate_completion_batch_resilient(
+                batch[midpoint:]
+            )
+
+    def _translate_completion_single_segment(self, segment: Segment) -> str:
+        term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
+        _, max_budget = _subtitle_char_budget(
+            duration=segment.duration,
+            target_cps=self.target_cps,
+            char_tolerance=self.char_tolerance,
+        )
+        max_tokens = max(32, min(160, max_budget * 4))
+        return _translate_completion_text(
+            translator=self,
+            text=segment.english,
+            prompt_builder=lambda t, p, s, d=segment.duration: _subtitle_completion_prompt(
+                t,
+                p,
+                s,
+                d,
+                self.target_cps,
+                self.char_tolerance,
+            ),
+            term_to_placeholder=term_to_placeholder,
+            placeholder_to_term=placeholder_to_term,
+            max_tokens=max_tokens,
+            empty_error_label=f"segment {segment.index}",
+        )
 
     def _translate_metadata_with_completion_model(self, metadata: VideoMetadata) -> VideoMetadata:
         term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
@@ -378,6 +464,7 @@ class OpenAICompatibleTranslator:
             "model": self.model,
             "temperature": 0.2,
             "messages": _build_chat_messages(self.model, system_prompt, user_prompt),
+            "max_tokens": 1024,
         }
         last_error: Exception | None = None
         for attempt in range(1, 5):
@@ -415,7 +502,14 @@ class OpenAICompatibleTranslator:
             "prompt": prompt,
             "temperature": 0.0,
             "max_tokens": max_tokens,
-            "stop": ["<end_of_turn>", "\n\nEnglish:", "\nEnglish:", "\n\n**Explanation:**"],
+            "stop": [
+                "<end_of_turn>",
+                "\n\nEnglish:",
+                "\nEnglish:",
+                "\n\n**Explanation:**",
+                "\n\nHere's",
+                "\nHere's",
+            ],
         }
         last_error: Exception | None = None
         for attempt in range(1, 5):
@@ -448,6 +542,7 @@ class OpenAICompatibleTranslator:
             "stream": False,
             "options": {
                 "temperature": 0.2,
+                "num_predict": 1024,
             },
             "messages": _build_chat_messages(self.model, system_prompt, user_prompt),
         }
@@ -533,10 +628,16 @@ def load_protected_terms(path: str | Path) -> list[str]:
 def _extract_json_object(text: str) -> dict:
     if isinstance(text, list):
         text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-    match = JSON_RE.search(text)
-    if not match:
-        raise RuntimeError(f"Could not find JSON in translator response: {text}")
-    return json.loads(match.group(0))
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        start = match.start()
+        try:
+            parsed, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise RuntimeError(f"Could not find JSON in translator response: {text}")
 
 
 def _is_ollama_base_url(base_url: str) -> bool:
@@ -573,6 +674,9 @@ def _batched(items: list[Segment], batch_size: int) -> Iterable[list[Segment]]:
 
 
 def _build_chat_messages(model: str, system_prompt: str, user_prompt: str) -> list[dict[str, str]]:
+    resolved_user_prompt = user_prompt
+    if _requires_no_think_directive(model):
+        resolved_user_prompt = f"/no_think\n{resolved_user_prompt}"
     if _requires_user_first_template(model):
         return [
             {
@@ -580,18 +684,30 @@ def _build_chat_messages(model: str, system_prompt: str, user_prompt: str) -> li
                 "content": (
                     "Follow these translation rules exactly.\n"
                     f"{system_prompt}\n\n"
-                    f"{user_prompt}"
+                    f"{resolved_user_prompt}"
                 ),
             }
         ]
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": resolved_user_prompt},
     ]
 
 
 def _requires_user_first_template(model: str) -> bool:
     return model.strip().lower().startswith("translategemma")
+
+
+def _requires_no_think_directive(model: str) -> bool:
+    normalized = model.strip().lower()
+    return normalized.startswith("qwen3")
+
+
+def _supports_completion_batch_mode(model: str) -> bool:
+    normalized = model.strip().lower()
+    if normalized.startswith("translategemma"):
+        return False
+    return True
 
 
 def _requires_completion_api(model: str) -> bool:
@@ -801,6 +917,15 @@ def _metadata_completion_prompt(
 
 def _completion_max_tokens(text: str, minimum: int, maximum: int) -> int:
     estimated = len(text) * 2 + 24
+    return max(minimum, min(maximum, estimated))
+
+
+def _completion_batch_max_tokens(
+    segments: list[Segment],
+    minimum: int = 128,
+    maximum: int = 1024,
+) -> int:
+    estimated = sum(len(segment.english) for segment in segments) * 2 + len(segments) * 32 + 64
     return max(minimum, min(maximum, estimated))
 
 

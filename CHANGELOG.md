@@ -8,6 +8,9 @@
 - Simplified config/CLI surface to unified-flow fields only and updated default TOML/ENV templates accordingly.
 - Updated subtitle-budget calculation to `L/V` form via `target_cps=4.5` with `char_tolerance=0.2` (±20%).
 - Switched timing planner behavior to strict boundary alignment with exact per-segment rate (`synthetic_duration / subtitle_duration`) without trim/crop retries.
+- Completion-model translation now supports adaptive batching for compatible models, with robust JSON extraction and automatic single-segment fallback for models that do not reliably emit batch JSON.
+- CosyVoice multi-worker execution now uses `as_completed` handling for quicker worker failure surfacing.
+- Synthesized-segment duration probing now runs in parallel.
 
 ### Added
 - Added `USAGE.zh-CN.md` as the unified usage manual.
