@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-04-01 (patch)
+
+### Added
+- Added `_is_qwen3_model()` helper to detect Qwen3 model variants by name prefix.
+- Qwen3 models now automatically receive `thinking_budget=0` in all chat/completion requests, disabling chain-of-thought reasoning and ensuring direct JSON output for translation tasks.
+- Qwen3 models also receive an empty pre-filled assistant think block (`<think>\n\n</think>`) as a fallback for backends that support assistant prefill.
+
+### Changed
+- Default translation model switched from `translategemma-4b-it-mlx-4bit` to `Qwen3.5-4B-MLX-4bit` in `videocut.toml`.
+- Verified optimal translation concurrency: `concurrency=4` with `batch_size=10` on Mac mini M-series gives ~2–3 min for 336 segments (~2 segs/s sustained).
+
 ## 2026-04-01
 
 ### Changed

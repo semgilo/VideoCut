@@ -7,7 +7,7 @@ runs_dir = "runs"
 [translation]
 llm_base_url = "http://127.0.0.1:8888/v1"
 llm_api_key = "2530"
-llm_model = "translategemma-4b-it-mlx-4bit"
+llm_model = "Qwen3.5-4B-MLX-4bit"
 llm_timeout = 120
 batch_size = 10
 concurrency = 4

@@ -466,6 +466,10 @@ class OpenAICompatibleTranslator:
             "messages": _build_chat_messages(self.model, system_prompt, user_prompt),
             "max_tokens": 1024,
         }
+        # Qwen3 thinking models: disable thinking entirely via thinking_budget=0
+        # so the model outputs the final answer directly without a reasoning block.
+        if _is_qwen3_model(self.model):
+            payload["thinking_budget"] = 0
         last_error: Exception | None = None
         for attempt in range(1, 5):
             try:
@@ -546,6 +550,8 @@ class OpenAICompatibleTranslator:
             },
             "messages": _build_chat_messages(self.model, system_prompt, user_prompt),
         }
+        if _is_qwen3_model(self.model):
+            payload["thinking_budget"] = 0
         last_error: Exception | None = None
         for attempt in range(1, 5):
             try:
@@ -688,10 +694,16 @@ def _build_chat_messages(model: str, system_prompt: str, user_prompt: str) -> li
                 ),
             }
         ]
-    return [
+    messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": resolved_user_prompt},
     ]
+    # Qwen3 thinking models: pre-fill an empty think block so the model skips
+    # reasoning and goes straight to the final answer. This is the official
+    # technique to disable thinking without a server-side parameter.
+    if _is_qwen3_model(model):
+        messages.append({"role": "assistant", "content": "<think>\n\n</think>\n"})
+    return messages
 
 
 def _requires_user_first_template(model: str) -> bool:
@@ -701,6 +713,10 @@ def _requires_user_first_template(model: str) -> bool:
 def _requires_no_think_directive(model: str) -> bool:
     normalized = model.strip().lower()
     return normalized.startswith("qwen3")
+
+
+def _is_qwen3_model(model: str) -> bool:
+    return model.strip().lower().startswith("qwen3")
 
 
 def _supports_completion_batch_mode(model: str) -> bool:
