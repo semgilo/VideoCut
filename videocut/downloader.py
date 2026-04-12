@@ -24,15 +24,19 @@ INFO_EXTENSIONS = (".info.json",)
 THUMBNAIL_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 YTDLP_REMOTE_COMPONENTS = "ejs:github"
 YTDLP_PREFERRED_VIDEO_FORMAT = (
-    "bestvideo*[height=1080][ext=mp4]+bestaudio[ext=m4a]/"
-    "bestvideo*[height=1080]+bestaudio/"
-    "best[height=1080]/"
-    "bestvideo*[height=720][ext=mp4]+bestaudio[ext=m4a]/"
-    "bestvideo*[height=720]+bestaudio/"
-    "best[height=720]/"
-    "bestvideo*[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-    "bestvideo*[height<=1080]+bestaudio/"
-    "best[height<=1080]/"
+    # bestvideo (no asterisk) = strictly video-only streams; avoids matching
+    # the 360p combined stream that bestvideo* prefers in newer yt-dlp.
+    "bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo[height=1080]+bestaudio[ext=m4a]/"
+    "bestvideo[height=1080]+bestaudio/"
+    "bestvideo[height=720][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo[height=720]+bestaudio[ext=m4a]/"
+    "bestvideo[height=720]+bestaudio/"
+    "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo[height<=1080]+bestaudio[ext=m4a]/"
+    "bestvideo[height<=1080]+bestaudio/"
+    "bestvideo+bestaudio[ext=m4a]/"
+    "bestvideo+bestaudio/"
     "best"
 )
 YTDLP_LOCK_PATH = Path(os.getenv("VIDEOCUT_YTDLP_LOCK_PATH", "/tmp/videocut-yt-dlp.lock"))
