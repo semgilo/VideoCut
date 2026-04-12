@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 
 from videocut.config import PipelineConfig, load_pipeline_config
+from videocut.cover import compose_cover_with_title
+from videocut.inpaint import InpaintMethod, inpaint_video, inpaint_video_ffmpeg, parse_region
 from videocut.pipeline import run_pipeline
 
 
@@ -49,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("cross_lingual", "zero_shot"),
         help="CosyVoice inference mode",
     )
+    run_parser.add_argument(
+        "--voice-clone",
+        dest="voice_clone",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable voice cloning. --no-voice-clone uses built-in speaker mode.",
+    )
+    run_parser.add_argument("--cosyvoice-speaker", help="Built-in CosyVoice speaker id used with --no-voice-clone")
     run_parser.add_argument("--cosyvoice-group-size", type=int, help="CosyVoice group size")
     run_parser.add_argument("--cosyvoice-concurrency", type=int, help="CosyVoice worker process count")
     run_parser.add_argument("--reference-audio", type=Path, help="Reference audio file for CosyVoice voice cloning")
@@ -72,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="platform_materials",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Export platform-specific publish materials for Douyin, Bilibili, and Xiaohongshu.",
+        help="Export platform-specific publish materials for Douyin, Bilibili, Xiaohongshu, and Tecent (WeChat Channels).",
     )
     run_parser.add_argument(
         "--cleanup-source",
@@ -81,6 +91,98 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Delete the source/ directory after publish assets are exported.",
     )
+
+    # ------------------------------------------------------------------
+    # inpaint  – logo removal / old-film scratch repair
+    # ------------------------------------------------------------------
+    inpaint_parser = subparsers.add_parser(
+        "inpaint",
+        help="Remove logos or repair old-film scratches via inpainting",
+    )
+    inpaint_parser.add_argument("input", type=Path, help="Input video file")
+    inpaint_parser.add_argument("output", type=Path, help="Output video file")
+    inpaint_parser.add_argument(
+        "--region",
+        dest="regions",
+        metavar="X,Y,W,H",
+        action="append",
+        default=[],
+        help=(
+            "Static region to inpaint every frame, e.g. '1720,40,180,60'. "
+            "Repeat --region to specify multiple areas (useful for multiple logos)."
+        ),
+    )
+    inpaint_parser.add_argument(
+        "--mask",
+        type=Path,
+        metavar="MASK_IMAGE",
+        help=(
+            "Greyscale mask image (same resolution as video recommended). "
+            "White pixels mark regions to inpaint; black pixels are kept."
+        ),
+    )
+    inpaint_parser.add_argument(
+        "--scratch",
+        dest="auto_scratch",
+        action="store_true",
+        help="Automatically detect and repair vertical film scratches.",
+    )
+    inpaint_parser.add_argument(
+        "--method",
+        choices=[m.value for m in InpaintMethod],
+        default=InpaintMethod.TELEA.value,
+        help=(
+            "Inpainting algorithm: "
+            "telea (fast marching, default), "
+            "ns (Navier-Stokes diffusion), "
+            "lama (deep-learning, requires 'pip install simple-lama-inpainting')."
+        ),
+    )
+    inpaint_parser.add_argument(
+        "--radius",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Neighbourhood radius in pixels for telea/ns (default: 5).",
+    )
+    inpaint_parser.add_argument(
+        "--scratch-sensitivity",
+        type=float,
+        default=1.0,
+        metavar="FLOAT",
+        help=(
+            "Scratch detection sensitivity for --scratch mode "
+            "(default 1.0; increase to catch lighter scratches, e.g. 1.5)."
+        ),
+    )
+    inpaint_parser.add_argument(
+        "--dilate",
+        type=int,
+        default=2,
+        metavar="PIXELS",
+        help="Expand the inpaint mask by this many pixels to avoid border rings (default: 2).",
+    )
+
+    cover_parser = subparsers.add_parser("cover", help="Compose a cover image with title and background box")
+    cover_parser.add_argument("--input", type=Path, required=True, help="Source image path")
+    cover_parser.add_argument("--output", type=Path, required=True, help="Output image path")
+    cover_parser.add_argument("--title", required=True, help="Title text to draw")
+    cover_parser.add_argument("--width", type=int, help="Optional output width")
+    cover_parser.add_argument("--height", type=int, help="Optional output height")
+    cover_parser.add_argument("--font-path", type=Path, help="Optional TTF/TTC font path")
+    cover_parser.add_argument("--font-size", type=int, help="Optional title font size in px")
+    cover_parser.add_argument(
+        "--position",
+        choices=("top", "center", "bottom"),
+        default="top",
+        help="Title box vertical anchor",
+    )
+    cover_parser.add_argument("--offset-y", type=int, default=0, help="Vertical offset from the selected anchor")
+    cover_parser.add_argument("--box-color", default="#000000", help="Title box color")
+    cover_parser.add_argument("--box-alpha", type=int, default=176, help="Title box opacity (0-255)")
+    cover_parser.add_argument("--text-color", default="#FFFFFF", help="Title text color")
+    cover_parser.add_argument("--stroke-color", default="#000000", help="Title stroke color")
+    cover_parser.add_argument("--stroke-width", type=int, help="Title stroke width in px")
     return parser
 
 
@@ -92,6 +194,79 @@ def main() -> None:
         config = load_pipeline_config(args.config)
         _apply_run_overrides(config, args)
         run_pipeline(args.url, config, workdir=args.workdir)
+        return
+
+    if args.command == "inpaint":
+        regions = []
+        for r in args.regions:
+            try:
+                regions.append(parse_region(r))
+            except ValueError as exc:
+                parser.error(str(exc))
+        if not regions and args.mask is None and not args.auto_scratch:
+            parser.error(
+                "Provide at least one of: --region X,Y,W,H, --mask FILE, or --scratch."
+            )
+
+        # If only static regions are requested and opencv is absent, use the
+        # ffmpeg delogo fast-path which has no extra Python dependencies.
+        use_ffmpeg_path = (
+            regions
+            and args.mask is None
+            and not args.auto_scratch
+            and args.method == InpaintMethod.TELEA.value  # default = no explicit override
+        )
+        if use_ffmpeg_path:
+            try:
+                import cv2  # noqa: F401
+                use_ffmpeg_path = False  # opencv available → use full path
+            except ImportError:
+                pass
+
+        if use_ffmpeg_path:
+            inpaint_video_ffmpeg(
+                input_path=args.input,
+                output_path=args.output,
+                regions=regions,
+            )
+        else:
+            inpaint_video(
+                input_path=args.input,
+                output_path=args.output,
+                regions=regions or None,
+                mask_path=args.mask,
+                auto_scratch=args.auto_scratch,
+                method=InpaintMethod(args.method),
+                radius=args.radius,
+                scratch_sensitivity=args.scratch_sensitivity,
+                dilate_pixels=args.dilate,
+            )
+        return
+
+    if args.command == "cover":
+        target_size: tuple[int, int] | None = None
+        if args.width is not None or args.height is not None:
+            if args.width is None or args.height is None:
+                parser.error("--width and --height must be set together.")
+            target_size = (args.width, args.height)
+
+        output_path = compose_cover_with_title(
+            source_path=args.input,
+            output_path=args.output,
+            title=args.title,
+            target_size=target_size,
+            font_path=args.font_path,
+            font_size=args.font_size,
+            position=args.position,
+            offset_y=args.offset_y,
+            box_color=args.box_color,
+            box_alpha=args.box_alpha,
+            text_color=args.text_color,
+            stroke_color=args.stroke_color,
+            stroke_width=args.stroke_width,
+        )
+        print(f"Cover generated: {output_path}")
+        return
 
 
 def _apply_run_overrides(config: PipelineConfig, args: argparse.Namespace) -> None:
@@ -99,6 +274,8 @@ def _apply_run_overrides(config: PipelineConfig, args: argparse.Namespace) -> No
         ("output_name", args.output_name),
         ("cosyvoice_python", args.cosyvoice_python),
         ("cosyvoice_mode", args.cosyvoice_mode),
+        ("enable_voice_clone", args.voice_clone),
+        ("cosyvoice_speaker", args.cosyvoice_speaker),
         ("reference_text", args.reference_text),
         ("llm_base_url", args.llm_base_url),
         ("llm_api_key", args.llm_api_key),

@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-04-12
+
+### Added
+- `videocut inpaint` command for logo/watermark removal and old-film scratch repair.
+  - Three algorithms: `telea` (Fast Marching, default), `ns` (Navier-Stokes), `lama` (deep learning via `simple-lama-inpainting`).
+  - `--region X,Y,W,H`: static bounding-box mask, repeatable for multiple logos.
+  - `--mask FILE`: greyscale mask image (white = inpaint).
+  - `--scratch`: automatic vertical scratch detection via column-stripe analysis.
+  - `--dilate`, `--radius`, `--scratch-sensitivity` for fine-tuning.
+  - Falls back to ffmpeg `delogo` filter when OpenCV is absent and only static regions are requested.
+- `videocut/inpaint.py`: core inpainting module with frame-level API (`inpaint_frame`, `inpaint_video`) and standalone ffmpeg helper (`inpaint_video_ffmpeg`).
+
+## 2026-04-08 (patch)
+
+### Added
+- Added `--voice-clone/--no-voice-clone` CLI switch for controlling whether CosyVoice runs in voice-clone mode.
+- Added CosyVoice config keys: `voice_clone` and `speaker` under `[cosyvoice]`.
+- Added non-clone `sft` mode support in `scripts/cosyvoice_batch.py` with automatic built-in speaker selection (or explicit `--speaker`).
+
+### Changed
+- Platform title generation is now deterministic and based on source/localized title + platform length limits (no hardcoded topic-rewrite titles).
+- Platform hashtag generation now enforces per-platform limits (抖音 5 / B站 6 / 小红书 10) using metadata tags + title keywords with dedup.
+- Cover text generation now derives directly from title and keeps 小红书 output to two lines.
+- Synced `README.md`, `README.zh-CN.md`, `USAGE.zh-CN.md`, and `OUTPUT_STANDARD.md` with the new voice-clone toggle and platform material rules.
+
 ## 2026-04-01 (patch)
 
 ### Added

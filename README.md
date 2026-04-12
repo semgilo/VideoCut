@@ -7,8 +7,10 @@ local LLM translation + CosyVoice synthesis + boundary-aligned render.
 - Fixed 10-step production flow (download, parse, translate, synthesize, measure, align, SRT, mix, render, publish assets)
 - Character budget from `L/V` (`V = 1/4.5`, tolerance `±20%`)
 - CosyVoice as the only TTS engine
+- Voice-clone toggle (`--voice-clone/--no-voice-clone`)
 - Per-segment stretch/compress to align synthesized speech to original subtitle start/end
 - `ffmpeg-full` preferred automatically
+- Video inpainting: logo/watermark removal and old-film scratch repair (`videocut inpaint ...`)
 
 ## Quick Start
 1. Install dependencies:
