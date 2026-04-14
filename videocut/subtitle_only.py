@@ -4,6 +4,7 @@ import json
 import math
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +57,14 @@ class PlatformSpec:
     cover_size: tuple[int, int] = (1280, 720)
 
 
+@dataclass(slots=True)
+class MaterialEvidence:
+    base_title: str
+    summary: str
+    highlights: list[str]
+    keywords: list[str]
+
+
 PLATFORM_SPECS = {
     "douyin": PlatformSpec(
         slug="douyin",
@@ -101,7 +110,7 @@ PLATFORM_SPECS = {
         ],
         publishing_notes=[
             "文件大小上限这里采用的是公开实操资料，而不是当前可直接访问到的静态官方帮助页。",
-            "在这次三个平台里，当前这份横版、只加字幕的成片与 Bilibili 的观看习惯最匹配。",
+            "在这批平台里，当前这份横版、只加字幕的成片与 Bilibili 的观看习惯最匹配。",
         ],
         sources=[
             {
@@ -161,6 +170,49 @@ PLATFORM_SPECS = {
         conservative=True,
         cover_size=(1242, 1660),
     ),
+    "tecent": PlatformSpec(
+        slug="tecent",
+        display_name="微信视频号",
+        format_allowlist=("mp4", "mov"),
+        max_size_bytes=2 * 1024 * 1024 * 1024,
+        max_duration_seconds=60 * 60,
+        preferred_aspect="16:9 / 9:16 兼容",
+        preferred_resolution="1080p 优先（横竖屏均可）",
+        cover_recommendation="封面标题控制在 12-16 字，主体居中，避免边缘信息被裁切。",
+        requirements_summary=[
+            "视频号支持横屏和竖屏内容，优先保证 1080p 清晰度与字幕可读性。",
+            "素材建议使用 mp4（H.264/AAC）或 mov，降低转码失败概率。",
+            "封面建议保持主体居中，标题尽量简洁，避免边缘信息被裁切。",
+            "平台规则会动态调整，最终以上传页面实时提示为准。",
+        ],
+        publishing_notes=[
+            "视频号审核更看重封面与首屏信息密度，建议标题直接点出核心价值。",
+            "这次仍使用共享成片，不额外生成视频号专用重剪版本。",
+        ],
+        sources=[
+            {
+                "label": "微信视频号创作中心",
+                "url": "https://channels.weixin.qq.com/platform",
+                "kind": "官方入口",
+            }
+        ],
+        conservative=True,
+        cover_size=(1080, 1260),
+    ),
+}
+
+PLATFORM_TITLE_LIMITS = {
+    "douyin": 36,
+    "bilibili": 60,
+    "xiaohongshu": 50,
+    "tecent": 30,
+}
+
+PLATFORM_HASHTAG_LIMITS = {
+    "douyin": 5,
+    "bilibili": 6,
+    "xiaohongshu": 10,
+    "tecent": 8,
 }
 
 
@@ -227,6 +279,11 @@ def run_subtitle_only_pipeline(
             timeout=config.llm_timeout,
             batch_size=config.translation_batch_size,
             concurrency=config.translation_concurrency,
+            target_cps=config.translation_target_cps,
+            min_playback_rate=config.min_playback_rate,
+            max_playback_rate=config.max_playback_rate,
+            enforce_char_budget=config.translation_enforce_char_budget,
+            budget_refine_passes=config.translation_budget_refine_passes,
             protected_terms=protected_terms,
         )
         print("Translating subtitles to Simplified Chinese...")
@@ -261,7 +318,7 @@ def run_subtitle_only_pipeline(
     ):
         print("Translating title, description, and tags...")
         try:
-            localized_metadata = translator.translate_metadata(download.source_metadata)
+            localized_metadata = _translate_metadata_with_llm(translator, download.source_metadata)
         except Exception as error:
             if config.translation_backend == "llm":
                 raise
@@ -317,6 +374,7 @@ def run_subtitle_only_pipeline(
             output_dir=platforms_dir,
             final_video=final_video,
             subtitle_path=generated_srt,
+            subtitle_segments=segments,
             publish_assets=publish_assets,
             source_metadata=download.source_metadata,
             localized_metadata=localized_metadata,
@@ -473,6 +531,38 @@ def _translate_metadata_with_google(metadata: VideoMetadata) -> VideoMetadata:
     )
 
 
+def _translate_metadata_with_llm(
+    translator: OpenAICompatibleTranslator,
+    metadata: VideoMetadata,
+) -> VideoMetadata:
+    def _translate_field(field_name: str, text: str) -> str:
+        if not text.strip():
+            return text
+        try:
+            return translator._translate_single_metadata_field(field_name, text)
+        except Exception as error:
+            print(f"Warning: metadata field '{field_name}' translation failed, keeping original: {error}")
+            return text
+
+    translated_tags: list[str] = []
+    for tag in metadata.tags:
+        normalized = str(tag).strip()
+        if not normalized:
+            continue
+        translated_tags.append(_translate_field("tag", normalized))
+
+    return VideoMetadata(
+        title=_translate_field("title", metadata.title),
+        description=_translate_field("description", metadata.description),
+        tags=translated_tags,
+        uploader=metadata.uploader,
+        channel=metadata.channel,
+        video_id=metadata.video_id,
+        webpage_url=metadata.webpage_url,
+        upload_date=metadata.upload_date,
+    )
+
+
 def _collect_video_profile(video_path: Path) -> dict[str, object]:
     width, height = ffprobe_video_size(video_path)
     duration_seconds = ffprobe_duration(video_path)
@@ -500,26 +590,33 @@ def _export_platform_kits(
     source_metadata: VideoMetadata | None,
     localized_metadata: VideoMetadata | None,
     video_profile: dict[str, object],
+    subtitle_segments: list[Segment] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     base_metadata = localized_metadata or source_metadata or VideoMetadata(title="未命名视频")
-    keyword_pool = _derive_keywords(base_metadata, source_metadata)
+    evidence = _build_material_evidence(
+        base_metadata=base_metadata,
+        source_metadata=source_metadata,
+        subtitle_segments=subtitle_segments,
+        subtitle_path=subtitle_path,
+    )
+    keyword_pool = evidence.keywords
     cover_path = publish_assets.get("cover_image")
 
     for slug, spec in PLATFORM_SPECS.items():
         platform_dir = output_dir / slug
         platform_dir.mkdir(parents=True, exist_ok=True)
 
-        title = _build_platform_title(spec, base_metadata.title)
+        title = _build_platform_title(spec, evidence.base_title)
         hashtags = _build_hashtags(spec, keyword_pool)
         description = _build_platform_description(
             spec=spec,
             title=title,
             source_metadata=source_metadata,
-            base_metadata=base_metadata,
+            evidence=evidence,
             hashtags=hashtags,
         )
-        cover_text = _build_cover_text(base_metadata.title, spec)
+        cover_text = _build_cover_text(evidence.base_title, spec)
         compatibility = _evaluate_compatibility(spec, video_profile)
         generated_cover_path = _export_platform_cover_assets(
             spec=spec,
@@ -576,260 +673,318 @@ def _export_platform_kits(
     )
 
 
+def _build_material_evidence(
+    base_metadata: VideoMetadata,
+    source_metadata: VideoMetadata | None,
+    subtitle_segments: list[Segment] | None,
+    subtitle_path: Path,
+) -> MaterialEvidence:
+    subtitle_lines = _collect_subtitle_lines(subtitle_segments, subtitle_path)
+    highlights = _pick_subtitle_highlights(subtitle_lines, max_items=3)
+    summary = _pick_summary_line(base_metadata, source_metadata, highlights)
+    base_title = _resolve_base_title(base_metadata, source_metadata, highlights)
+    keywords = _derive_keywords(base_metadata, source_metadata, subtitle_lines)
+    return MaterialEvidence(
+        base_title=base_title,
+        summary=summary,
+        highlights=highlights,
+        keywords=keywords,
+    )
+
+
+def _resolve_base_title(
+    base_metadata: VideoMetadata,
+    source_metadata: VideoMetadata | None,
+    highlights: list[str],
+) -> str:
+    for candidate in (
+        base_metadata.title,
+        source_metadata.title if source_metadata is not None else "",
+    ):
+        normalized = _sanitize_base_title(candidate)
+        if normalized:
+            return normalized
+    for line in highlights:
+        normalized = _sanitize_base_title(line)
+        if normalized:
+            return _truncate_text(normalized, 42)
+    return "未命名视频"
+
+
+def _pick_summary_line(
+    base_metadata: VideoMetadata,
+    source_metadata: VideoMetadata | None,
+    highlights: list[str],
+) -> str:
+    for candidate in (
+        _first_sentence(base_metadata.description),
+        _first_sentence(source_metadata.description if source_metadata is not None else ""),
+    ):
+        if candidate:
+            return candidate
+    if highlights:
+        return highlights[0]
+    return ""
+
+
+def _collect_subtitle_lines(
+    subtitle_segments: list[Segment] | None,
+    subtitle_path: Path,
+    max_lines: int = 320,
+) -> list[str]:
+    raw_lines: list[str] = []
+    if subtitle_segments:
+        for segment in subtitle_segments:
+            text = _normalize_space(segment.chinese or segment.english)
+            if _subtitle_line_usable(text):
+                raw_lines.append(text)
+    elif subtitle_path.exists() and subtitle_path.suffix.lower() == ".srt":
+        raw_lines.extend(_load_subtitle_lines_from_srt(subtitle_path))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for line in raw_lines:
+        normalized = _normalize_space(line)
+        if not _subtitle_line_usable(normalized):
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+        if len(deduped) >= max_lines:
+            break
+    return deduped
+
+
+def _load_subtitle_lines_from_srt(path: Path) -> list[str]:
+    content = path.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n\s*\n", content)
+    lines: list[str] = []
+    for block in blocks:
+        raw_lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not raw_lines:
+            continue
+        timestamp_index = next((index for index, line in enumerate(raw_lines) if "-->" in line), -1)
+        if timestamp_index < 0:
+            continue
+        text_lines = [_normalize_space(line) for line in raw_lines[timestamp_index + 1 :] if _normalize_space(line)]
+        if not text_lines:
+            continue
+        chinese_candidates = [line for line in text_lines if _contains_cjk(line)]
+        candidate = chinese_candidates[0] if chinese_candidates else text_lines[0]
+        if _subtitle_line_usable(candidate):
+            lines.append(candidate)
+    return lines
+
+
+def _subtitle_line_usable(text: str) -> bool:
+    cleaned = _normalize_space(text).strip("-*• ")
+    if not cleaned:
+        return False
+    if re.fullmatch(r"[\d\W_]+", cleaned):
+        return False
+    if _contains_cjk(cleaned):
+        return len(cleaned) >= 4
+    return len(cleaned) >= 12
+
+
+def _pick_subtitle_highlights(lines: list[str], max_items: int) -> list[str]:
+    if max_items <= 0:
+        return []
+    candidates = [_truncate_text(line, 80) for line in lines if _subtitle_line_usable(line)]
+    if not candidates:
+        return []
+    if len(candidates) <= max_items:
+        return candidates
+
+    selected: list[str] = []
+    if max_items == 1:
+        selected.append(candidates[len(candidates) // 2])
+    else:
+        for i in range(max_items):
+            index = int(round(i * (len(candidates) - 1) / (max_items - 1)))
+            candidate = candidates[index]
+            if candidate not in selected:
+                selected.append(candidate)
+    for candidate in candidates:
+        if len(selected) >= max_items:
+            break
+        if candidate not in selected:
+            selected.append(candidate)
+    return selected[:max_items]
+
+
 def _derive_keywords(
     localized_metadata: VideoMetadata,
     source_metadata: VideoMetadata | None,
+    subtitle_lines: list[str],
 ) -> list[str]:
-    title_text = localized_metadata.title or (source_metadata.title if source_metadata else "")
-    source_text = source_metadata.title if source_metadata is not None else ""
-    combined = " ".join(
-        [
-            title_text,
-            localized_metadata.description,
-            source_text,
-            source_metadata.description if source_metadata is not None else "",
-        ]
-    ).lower()
-
     keywords: list[str] = []
-    if "openclaw" in combined:
-        keywords.append("OpenClaw")
-    if "ai" in combined:
-        keywords.append("AI工具")
-    if "agent" in combined or "代理" in combined:
-        keywords.append("AI代理")
-    if "automation" in combined or "自动化" in combined:
-        keywords.append("自动化")
-    if "workflow" in combined or "工作流" in combined:
-        keywords.append("工作流")
-    if "productivity" in combined or "效率" in combined or "life" in combined:
-        keywords.append("效率工具")
-    keywords.extend(["字幕翻译", "原声保留"])
+    keyword_sources = [
+        *localized_metadata.tags,
+        *(source_metadata.tags if source_metadata is not None else []),
+        *_extract_title_keywords(localized_metadata.title or source_metadata.title if source_metadata else ""),
+        *_extract_subtitle_keywords(subtitle_lines),
+    ]
+    for item in keyword_sources:
+        normalized = _normalize_keyword(item)
+        if normalized:
+            keywords.append(normalized)
 
     deduped: list[str] = []
     seen: set[str] = set()
     for keyword in keywords:
-        if keyword in seen:
+        lowered = keyword.lower()
+        if lowered in seen:
             continue
         deduped.append(keyword)
-        seen.add(keyword)
-    return deduped[:6]
+        seen.add(lowered)
+    return deduped[:18]
+
+
+def _extract_subtitle_keywords(lines: list[str], limit: int = 18) -> list[str]:
+    if not lines:
+        return []
+    latin_stopwords = {
+        "the",
+        "and",
+        "that",
+        "this",
+        "with",
+        "for",
+        "from",
+        "your",
+        "you",
+        "are",
+        "was",
+        "have",
+        "has",
+        "not",
+        "just",
+        "what",
+        "when",
+        "where",
+        "how",
+        "into",
+        "then",
+        "than",
+        "about",
+        "video",
+        "subtitle",
+        "subtitles",
+    }
+    counts: Counter[str] = Counter()
+    values: dict[str, str] = {}
+    for line in lines:
+        for token in _tokenize_keywords(line):
+            cleaned = _normalize_keyword(token).replace(" ", "")
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in latin_stopwords or len(cleaned) < 2:
+                continue
+            values.setdefault(lowered, cleaned)
+            counts[lowered] += 1
+
+    ranked = sorted(
+        counts.items(),
+        key=lambda item: (-item[1], len(item[0]), item[0]),
+    )
+    return [values[key] for key, _ in ranked[:limit]]
+
+
+def _tokenize_keywords(text: str) -> list[str]:
+    chunks = re.split(r"[^\w\u4e00-\u9fff+\-]+", text)
+    tokens: list[str] = []
+    for chunk in chunks:
+        normalized = chunk.strip()
+        if not normalized:
+            continue
+        if _contains_cjk(normalized):
+            continue
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9+\-]{2,24}", normalized):
+            tokens.append(normalized)
+    return tokens
 
 
 def _build_platform_title(spec: PlatformSpec, base_title: str) -> str:
-    clean = _normalize_space(base_title) or "视频字幕翻译版"
-    title_lower = clean.lower()
+    clean = _sanitize_base_title(base_title) or "未命名视频"
 
     if spec.slug == "douyin":
-        return _truncate_text(f"{clean}｜中文字幕版", 36)
+        return _compose_title_with_suffix(clean, "｜中文字幕", PLATFORM_TITLE_LIMITS["douyin"])
 
     if spec.slug == "bilibili":
-        return _truncate_text(f"【中文字幕】{clean}", 60)
+        clean = re.sub(r"^【\s*中文字幕\s*】", "", clean).strip()
+        return _truncate_text(f"【中文字幕】{clean}", PLATFORM_TITLE_LIMITS["bilibili"])
 
     if spec.slug == "xiaohongshu":
-        # XHS style: catchy, emoji, shorter
-        if "openclaw" in title_lower:
-            return "OpenClaw教程｜本地AI自动化神器 🚀"
-        if "local" in title_lower or "llm" in title_lower:
-            if any(x in title_lower for x in ["$", "money", "万", "花", "spent"]):
-                return "花了5万刀测试后｜本地AI入门全攻略💰"
-            return "本地AI模型教程｜零门槛上手 🔥"
-        if "how to" in title_lower or "guide" in title_lower:
-            return f"{clean[:20]}｜超详细教程 ⭐"
-        return _truncate_text(f"{clean}｜中文字幕版", 22)
+        return _compose_title_with_suffix(clean, "｜中文字幕", PLATFORM_TITLE_LIMITS["xiaohongshu"])
+
+    if spec.slug == "tecent":
+        return _compose_title_with_suffix(clean, "｜中文字幕", PLATFORM_TITLE_LIMITS["tecent"])
 
     return _truncate_text(f"【字幕翻译】{clean}", 22)
 
 
 def _build_hashtags(spec: PlatformSpec, keywords: list[str]) -> list[str]:
-    tags = [f"#{keyword}" for keyword in keywords]
-    if spec.slug == "douyin":
-        return tags[:5]
-    if spec.slug == "bilibili":
-        return tags[:6]
-    if spec.slug == "xiaohongshu":
-        # XHS can use up to 10 hashtags, add some general ones
-        xhs_extra = ["#干货分享", "#学习笔记", "#科技数码"]
-        return (tags + xhs_extra)[:10]
-    return tags[:5]
+    limit = PLATFORM_HASHTAG_LIMITS.get(spec.slug, 5)
+    hashtags: list[str] = []
+    seen: set[str] = set()
+    for keyword in keywords:
+        cleaned = _normalize_keyword(keyword).replace(" ", "")
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        hashtags.append(f"#{cleaned}")
+        if len(hashtags) >= limit:
+            break
+    return hashtags
 
 
 def _build_platform_description(
     spec: PlatformSpec,
     title: str,
     source_metadata: VideoMetadata | None,
-    base_metadata: VideoMetadata,
+    evidence: MaterialEvidence,
     hashtags: list[str],
 ) -> str:
-    origin_line = (
-        f"原视频：{source_metadata.webpage_url}\n"
-        f"来源频道：{source_metadata.channel or source_metadata.uploader}\n"
-        if source_metadata is not None and source_metadata.webpage_url
-        else ""
-    )
-    base_summary = _first_sentence(base_metadata.description)
-    if not base_summary:
-        base_summary = "本稿仅做中文字幕翻译，保留原始音轨，不做配音或声音克隆。"
-
-    if spec.slug == "douyin":
-        lines = [
-            "本条仅做中文字幕翻译，保留原声。",
-            base_summary,
-            origin_line.rstrip(),
-            " ".join(hashtags),
-        ]
-        return "\n".join(line for line in lines if line) + "\n"
-
-    if spec.slug == "bilibili":
-        lines = [
-            "本稿说明：仅添加中文字幕，保留英文原声，不做中文配音或声音克隆。",
-            f"视频标题：{title}",
-        ]
-        if base_summary:
-            lines.append(f"内容摘要：{base_summary}")
-        if origin_line:
-            lines.append(origin_line.rstrip())
+    lines = [f"视频标题：{title}"]
+    if evidence.summary:
+        lines.append(f"简介摘录：{evidence.summary}")
+    if evidence.highlights:
+        lines.append("字幕摘录：")
+        for item in evidence.highlights:
+            lines.append(f"- {item}")
+    if source_metadata is not None and source_metadata.webpage_url:
+        lines.append(f"原视频：{source_metadata.webpage_url}")
+    if source_metadata is not None and (source_metadata.channel or source_metadata.uploader):
+        lines.append(f"来源频道：{source_metadata.channel or source_metadata.uploader}")
+    # 抖音 description 不拼 hashtags——hashtags 已单独写入 hashtags.txt
+    # 把 hashtags 放进 description 会导致 Playwright 输入时触发 mention 弹框，拦截后续操作
+    if spec.slug != "douyin" and hashtags:
         lines.append("标签建议：" + " ".join(hashtags))
-        return "\n".join(line for line in lines if line) + "\n"
-
-    if spec.slug == "xiaohongshu":
-        return _build_xiaohongshu_description(base_metadata, source_metadata, hashtags)
-
-    lines = [
-        "这是一条中文字幕翻译版视频，保留原声，不做配音。",
-        base_summary,
-        origin_line.rstrip(),
-        " ".join(hashtags),
-    ]
     return "\n".join(line for line in lines if line) + "\n"
 
 
-def _build_xiaohongshu_description(
-    base_metadata: VideoMetadata,
-    source_metadata: VideoMetadata | None,
-    hashtags: list[str],
-) -> str:
-    """Generate Xiaohongshu-style notes based on video content."""
-    title_lower = (base_metadata.title or "").lower()
-    desc_lower = (base_metadata.description or "").lower()
-    combined = title_lower + " " + desc_lower
-
-    # Detect content topics
-    is_ai_local = "local" in combined or "本地" in combined or "llm" in combined
-    is_openclaw = "openclaw" in combined
-    is_tutorial = "how to" in combined or "guide" in combined or "教程" in combined
-    is_money = "money" in combined or "$" in combined or "万" in combined or "赚" in combined
-
-    lines = []
-
-    # Opening hook
-    if is_money and is_ai_local:
-        lines.append("姐妹们！今天分享一个超硬核的AI教程 🔥")
-        lines.append("")
-        lines.append(f"博主@{source_metadata.uploader if source_metadata else '原作者'} 花了大量时间和金钱测试各种AI工具，最终整理出这份实用指南")
-    elif is_openclaw:
-        lines.append("发现了一个超实用的AI自动化工具！🚀")
-        lines.append("")
-        lines.append("OpenClaw 可以让你用自然语言指挥AI完成各种任务，不用写代码也能搭建自动化 workflow")
-    elif is_tutorial:
-        lines.append("干货分享！今天这个教程值得收藏 ⭐")
-        lines.append("")
-        lines.append("英文字幕已翻译，内容硬核但讲得很清楚，小白也能看懂")
-    else:
-        lines.append("今天分享一个超赞的英文视频翻译版 🎬")
-        lines.append("")
-        lines.append("原视频干货满满，已经加上了中文字幕，方便大家食用～")
-
-    lines.append("")
-    lines.append("📌 视频亮点速览：")
-    lines.append("")
-
-    # Generate bullet points based on content
-    if is_ai_local:
-        lines.append("1️⃣ 什么是本地AI？")
-        lines.append("不需要联网、数据还私密，完全在你自己设备上运行的AI")
-        lines.append("")
-        lines.append("2️⃣ 需要什么设备？")
-        lines.append("从普通电脑到专业设备，博主会告诉你不同预算的配置方案")
-        lines.append("")
-
-    if is_openclaw:
-        lines.append(f"{'3️⃣' if is_ai_local else '1️⃣'} OpenClaw 能做什么？")
-        lines.append("连接各种AI模型和工具，让AI自动帮你完成复杂任务")
-        lines.append("")
-
-    if is_money:
-        lines.append(f"{'4️⃣' if (is_ai_local and is_openclaw) else ('3️⃣' if (is_ai_local or is_openclaw) else '2️⃣')} 省钱/赚钱思路")
-        lines.append("不用订阅一堆付费服务，本地部署一次搞定，还能接私活")
-        lines.append("")
-
-    # Add generic points if we don't have enough
-    point_num = 2 if (is_ai_local and is_openclaw and is_money) else (
-        3 if ((is_ai_local and is_openclaw) or (is_ai_local and is_money) or (is_openclaw and is_money)) else (
-        4 if (is_ai_local or is_openclaw or is_money) else 1
-    ))
-
-    if point_num <= 3:
-        lines.append(f"{point_num}️⃣ 实用技巧")
-        lines.append("博主分享了很多实操经验，跟着做就能上手")
-        lines.append("")
-        point_num += 1
-
-    # Target audience
-    lines.append("💡 适合谁看：")
-    if is_ai_local:
-        lines.append("» 担心隐私泄露，不想把数据传到云端的宝子")
-        lines.append("» 想省钱，不想每个月交各种AI订阅费的")
-    if is_openclaw:
-        lines.append("» 想用AI提效，但不想学编程的")
-    lines.append("» 对AI感兴趣，想从零开始学的")
-    lines.append("")
-
-    # Closing
-    lines.append("🎬 英文字幕已翻译，放心食用～")
-    lines.append("")
-
-    # Origin info
-    if source_metadata and source_metadata.webpage_url:
-        lines.append(f"原视频：{source_metadata.webpage_url}")
-        if source_metadata.uploader or source_metadata.channel:
-            lines.append(f"来源频道：{source_metadata.channel or source_metadata.uploader}")
-        lines.append("")
-
-    # Hashtags
-    lines.append(" ".join(hashtags[:8]))  # XHS can use more hashtags
-
-    return "\n".join(lines) + "\n"
-
-
 def _build_cover_text(title: str, spec: PlatformSpec | None = None) -> str:
-    normalized = _normalize_space(title)
-    title_lower = normalized.lower()
+    normalized = _sanitize_base_title(title)
+    compact = re.split(r"[：:|｜\-]", normalized)[0].strip() if normalized else ""
+    compact = compact or "中文字幕版"
 
-    # XHS specific cover text
     if spec and spec.slug == "xiaohongshu":
-        if "openclaw" in title_lower:
-            return "OpenClaw\nAI自动化神器"
-        if "local" in title_lower or "llm" in title_lower:
-            if any(x in title_lower for x in ["$", "money", "万", "花", "spent"]):
-                return "5万刀实测\n本地AI攻略"
-            return "本地AI\n零基础入门"
-        if "how to" in title_lower or "教程" in title_lower:
-            return "硬核教程\n建议收藏"
-        # Default XHS style
-        compact = re.sub(r"^[【\[].*?[】\]]", "", normalized).strip()
-        compact = re.split(r"[：:|｜\-]", compact)[0].strip()
-        if len(compact) > 10:
-            return _truncate_text(compact, 10) + "\n干货分享"
-        return (compact or "中文字幕") + "\n建议收藏"
+        if not _contains_cjk(compact):
+            return "中文字幕\n原声保留"
+        lines = _split_cover_lines(compact, max_line_length=10, max_lines=2)
+        if not lines:
+            lines = ["中文字幕", "原声保留"]
+        elif len(lines) == 1:
+            lines.append("中文字幕")
+        return "\n".join(lines[:2])
 
-    # Default for other platforms
-    if re.search(r"\bopenclaw\b", normalized, flags=re.IGNORECASE):
-        return "OpenClaw 5个实用场景"
-    compact = re.sub(r"^[【\[].*?[】\]]", "", normalized).strip()
-    compact = re.split(r"[：:|｜\-]", compact)[0].strip()
-    if not compact:
-        return "中文字幕版"
     return _truncate_text(compact, 14)
 
 
@@ -844,6 +999,8 @@ def _evaluate_compatibility(spec: PlatformSpec, video_profile: dict[str, object]
     size_ok = spec.max_size_bytes is None or size_bytes <= spec.max_size_bytes
     preferred_aspect_ok = aspect_ratio == spec.preferred_aspect or (
         spec.slug == "xiaohongshu" and aspect_ratio in {"9:16", "3:4"}
+    ) or (
+        spec.slug == "tecent" and aspect_ratio in {"16:9", "9:16"}
     )
 
     needs_compression = spec.max_size_bytes is not None and size_bytes > spec.max_size_bytes
@@ -918,6 +1075,8 @@ def _render_platform_requirements(
             "",
             "## 封面与包装方向",
             "",
+            f"- 标题建议上限：{PLATFORM_TITLE_LIMITS.get(spec.slug, 22)} 字",
+            f"- 标签建议上限：{PLATFORM_HASHTAG_LIMITS.get(spec.slug, 5)} 个",
             f"- 推荐比例：{spec.preferred_aspect}",
             f"- 推荐分辨率：{spec.preferred_resolution}",
             f"- 封面建议：{spec.cover_recommendation}",
@@ -1093,6 +1252,103 @@ def _first_sentence(text: str) -> str:
 
 def _normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _sanitize_base_title(title: str) -> str:
+    clean = _normalize_space(title)
+    clean = re.sub(r"\s*\[[A-Za-z0-9_-]{6,}\]\s*$", "", clean).strip()
+    clean = re.sub(r"\s*\((Official Video|Official Trailer)\)\s*$", "", clean, flags=re.IGNORECASE).strip()
+    return clean
+
+
+def _extract_title_keywords(title: str) -> list[str]:
+    clean = _sanitize_base_title(title)
+    if not clean:
+        return []
+    tokens = [token.strip() for token in re.split(r"[：:|｜\-_,，。.!?、【】\[\]()/]+", clean) if token.strip()]
+    keywords: list[str] = []
+    for token in tokens:
+        normalized = _normalize_keyword(token)
+        if not normalized:
+            continue
+        if normalized.isdigit():
+            continue
+        keywords.append(normalized)
+    return keywords[:8]
+
+
+def _normalize_keyword(text: str) -> str:
+    cleaned = _normalize_space(text).lstrip("#")
+    cleaned = re.sub(r"[\"'“”‘’`]+", "", cleaned)
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff+\- ]+", "", cleaned)
+    cleaned = cleaned.strip(" -_")
+    if not cleaned:
+        return ""
+    if len(cleaned) > 24:
+        return cleaned[:24].strip()
+    return cleaned
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _split_cover_lines(text: str, max_line_length: int, max_lines: int) -> list[str]:
+    clean = _normalize_space(text)
+    if not clean:
+        return []
+    units = [item.strip() for item in re.split(r"[：:|｜\-_,，。.!?、/]+", clean) if item.strip()]
+    if not units:
+        units = [clean]
+
+    lines: list[str] = []
+    for unit in units:
+        wrapped = _wrap_text_to_lines(unit, max_line_length)
+        for line in wrapped:
+            if len(lines) >= max_lines:
+                break
+            lines.append(line)
+        if len(lines) >= max_lines:
+            break
+    return [line for line in lines if line]
+
+
+def _wrap_text_to_lines(text: str, max_line_length: int) -> list[str]:
+    if " " in text:
+        words = [word for word in text.split(" ") if word]
+        if words:
+            lines: list[str] = []
+            current = ""
+            for word in words:
+                candidate = word if not current else f"{current} {word}"
+                if len(candidate) <= max_line_length:
+                    current = candidate
+                    continue
+                if current:
+                    lines.append(current)
+                if len(word) <= max_line_length:
+                    current = word
+                    continue
+                lines.extend(word[index : index + max_line_length] for index in range(0, len(word), max_line_length))
+                current = ""
+            if current:
+                lines.append(current)
+            if lines:
+                return lines
+
+    return [text[index : index + max_line_length].strip() for index in range(0, len(text), max_line_length)]
+
+
+def _compose_title_with_suffix(base: str, suffix: str, limit: int) -> str:
+    clean_base = _normalize_space(base)
+    clean_suffix = _normalize_space(suffix)
+    candidate = f"{clean_base}{clean_suffix}"
+    if len(candidate) <= limit:
+        return candidate
+    keep = limit - len(clean_suffix) - 1
+    if keep <= 0:
+        return _truncate_text(candidate, limit)
+    return f"{clean_base[:keep].rstrip()}…{clean_suffix}"
 
 
 def _truncate_text(text: str, limit: int) -> str:

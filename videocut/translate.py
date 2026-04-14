@@ -129,18 +129,18 @@ class OpenAICompatibleTranslator:
             self.protected_terms,
         )
         system_prompt = (
-            "You localize YouTube video metadata into concise, natural Simplified Chinese. "
-            "Translate the title, description, and tags while preserving proper nouns exactly, "
+            "You localize YouTube video metadata into accurate Simplified Chinese. "
+            "Translate the title, description, and tags directly from source text while preserving proper nouns exactly, "
             "including personal names, brand names, product names, place names, @handles, URLs, "
             "hashtags, model numbers, and numeric values. Keep the original meaning and tone. "
             "If placeholder tokens like [[VC_TERM_0001]] appear, copy them exactly and do not translate, "
             "remove, or rename them. "
-            "Do not invent facts or add marketing filler. If source tags are empty, derive a small set "
-            "of grounded tags from the title and description only. "
+            "Do not invent facts, add marketing filler, or rewrite into new claims. "
+            "If source tags are empty, return an empty tags list. "
             'Return JSON only with this shape: {"title":"...","description":"...","tags":["..."]}.'
         )
         user_prompt = (
-            "Localize this metadata to Simplified Chinese while preserving proper nouns. "
+            "Translate this metadata to Simplified Chinese with strict faithfulness to the source. "
             "If any [[VC_TERM_xxxx]] token appears, keep it unchanged in the output.\n"
             f"{json.dumps(masked_metadata, ensure_ascii=False)}"
         )
@@ -148,6 +148,7 @@ class OpenAICompatibleTranslator:
         translated_tags = parsed.get("tags")
         if not isinstance(translated_tags, list):
             raise RuntimeError(f"Unexpected metadata payload: {parsed}")
+        source_tags = [str(tag).strip() for tag in metadata.tags if str(tag).strip()]
         restored_title = _restore_masked_text(
             str(parsed.get("title") or metadata.title).strip(),
             required_placeholders["title"],
@@ -158,15 +159,19 @@ class OpenAICompatibleTranslator:
             required_placeholders["description"],
             placeholder_to_term,
         )
-        restored_tags = [
-            _restore_masked_text(
-                str(tag).strip(),
+        restored_tags: list[str] = []
+        for index, source_tag in enumerate(source_tags):
+            raw_tag = str(translated_tags[index]).strip() if index < len(translated_tags) else source_tag
+            candidate_tag = raw_tag or source_tag
+            restored_tag = _restore_masked_text(
+                candidate_tag,
                 required_placeholders["tags"][index] if index < len(required_placeholders["tags"]) else [],
                 placeholder_to_term,
             )
-            for index, tag in enumerate(translated_tags)
-            if str(tag).strip()
-        ]
+            # Drop any tag that is a bare XML/think tag leaking from the model
+            if re.fullmatch(r"</?[a-zA-Z_][a-zA-Z0-9_]*\s*/?>", restored_tag.strip()):
+                continue
+            restored_tags.append(restored_tag)
         return VideoMetadata(
             title=restored_title,
             description=restored_description,
@@ -321,6 +326,31 @@ class OpenAICompatibleTranslator:
             max_tokens=max_tokens,
             empty_error_label=f"segment {segment.index}",
         )
+
+    def _translate_single_metadata_field(self, field_name: str, text: str) -> str:
+        """翻译单个元数据字段。先尝试带 placeholder 保护；失败则降级为无保护直接翻译。"""
+        if not text.strip():
+            return text
+        term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
+        # 第一次尝试：带 placeholder 保护
+        try:
+            return _translate_completion_field(
+                translator=self,
+                text=text,
+                field_name=field_name,
+                term_to_placeholder=term_to_placeholder,
+                placeholder_to_term=placeholder_to_term,
+            )
+        except RuntimeError as first_err:
+            print(f"  [{field_name}] placeholder-protected translation failed ({first_err}), retrying without protection...")
+        # 降级：直接翻译，不使用 placeholder，接受保护词可能被模型处理
+        max_tok = _completion_max_tokens(text, minimum=96, maximum=512)
+        prompt = _metadata_completion_prompt(field_name, text, [], strict=False)
+        completion = self._complete_text(prompt=prompt, max_tokens=max_tok)
+        cleaned = _clean_completion_translation(completion)
+        if not cleaned:
+            raise RuntimeError(f"Completion returned empty text for metadata field {field_name}")
+        return cleaned
 
     def _translate_metadata_with_completion_model(self, metadata: VideoMetadata) -> VideoMetadata:
         term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
@@ -631,9 +661,15 @@ def load_protected_terms(path: str | Path) -> list[str]:
     )
 
 
+def _strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> blocks that thinking models may emit."""
+    return re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+
+
 def _extract_json_object(text: str) -> dict:
     if isinstance(text, list):
         text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+    text = _strip_think_blocks(text)
     decoder = json.JSONDecoder()
     for match in re.finditer(r"\{", text):
         start = match.start()
@@ -922,8 +958,12 @@ def _metadata_completion_prompt(
     placeholders: list[str],
     strict: bool,
 ) -> str:
+    field_label = f"YouTube {field_name}"
+    if field_name == "tag":
+        field_label = "YouTube tag"
     return (
-        f"Translate the following YouTube {field_name} into concise natural Simplified Chinese. "
+        f"Translate the following {field_label} into accurate Simplified Chinese. "
+        "Do not add new facts or marketing phrases. Keep the meaning faithful to the source. "
         f"{_placeholder_instruction(placeholders, strict)} "
         "Return only the translation. No explanations. No quotes.\n\n"
         f"English: {text}\n"

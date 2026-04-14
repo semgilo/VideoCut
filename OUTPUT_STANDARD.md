@@ -21,8 +21,10 @@
 │   │   # 示例: /Users/semgilo/Documents/git/VideoCut/runs/xxx/platforms/douyin/
 │   ├── bilibili/                                   # B站
 │   │   # 示例: /Users/semgilo/Documents/git/VideoCut/runs/xxx/platforms/bilibili/
-│   └── xiaohongshu/                                # 小红书
-│       # 示例: /Users/semgilo/Documents/git/VideoCut/runs/xxx/platforms/xiaohongshu/
+│   ├── xiaohongshu/                                # 小红书
+│   │   # 示例: /Users/semgilo/Documents/git/VideoCut/runs/xxx/platforms/xiaohongshu/
+│   └── tecent/                                     # 微信视频号
+│       # 示例: /Users/semgilo/Documents/git/VideoCut/runs/xxx/platforms/tecent/
 ├── publish/                                         # 通用发布材料
 ├── manifest.json                                   # 完整任务清单
 └── delivery_summary.md                             # 交付摘要
@@ -70,13 +72,12 @@
 ### 平台特定要求
 
 #### 小红书 (xiaohongshu/)
-- **标题**: 带emoji，口语化，22字以内
-- **描述**: 
-  - 开场钩子（"姐妹们！今天分享..."）
-  - 📌 视频亮点速览（1️⃣ 2️⃣ 3️⃣ 分点）
-  - 💡 适合谁看
+- **标题**: 基于原始标题生成，统一追加 `｜中文字幕`，50字以内（不编造新主题）
+- **描述**:
+  - 说明“仅做字幕翻译，保留原声”
+  - 内容摘要
   - 原视频链接
-  - 标签（最多10个）
+  - 标签建议（最多10个）
 - **封面**: 3:4比例，1242x1660
 - **封面文字**: 两行，每行不超过10字
 
@@ -91,13 +92,22 @@
 - **封面**: 16:9比例，1280x720
 
 #### 抖音 (douyin/)
-- **标题**: 简洁+｜中文字幕版，36字以内
+- **标题**: 基于原始标题生成，统一追加 `｜中文字幕`，36字以内
 - **描述**: 
   - 简短说明
   - 内容摘要
   - 原视频链接
-  - 标签（最多5个）
+  - 标签建议（最多5个）
 - **封面**: 9:16比例，1080x1920
+
+#### 微信视频号 (tecent/)
+- **标题**: 基于原始标题生成，统一追加 `｜中文字幕`，30字以内
+- **描述**:
+  - 说明“仅做字幕翻译，保留原声”
+  - 内容摘要
+  - 原视频链接
+  - 标签建议（最多8个）
+- **封面**: 1080x1260
 
 ## 通用发布材料（publish/）
 
@@ -137,9 +147,10 @@
 发布前确认：
 - [ ] `final_subtitled.mp4` 存在且可播放
 - [ ] 字幕显示正常（中文在上，英文在下）
-- [ ] `platforms/` 目录存在且包含3个平台
+- [ ] `platforms/` 目录存在且包含4个平台
 - [ ] 每个平台目录包含完整8个文件
-- [ ] 小红书 `description.txt` 内容完整（不是简单的一句话）
+- [ ] 各平台 `title.txt` 与视频主题一致（无明显“跑题标题”）
+- [ ] 各平台 `hashtags.txt` 数量符合限制（抖音5/B站6/小红书10/视频号8）
 - [ ] 封面图片清晰，文字可读
 
 ## 下游消费接口
@@ -171,6 +182,9 @@ B站:        /Users/semgilo/Documents/git/VideoCut/runs/<video_id>-<timestamp>/p
 └── (同上8个文件)
 
 小红书:     /Users/semgilo/Documents/git/VideoCut/runs/<video_id>-<timestamp>/platforms/xiaohongshu/
+└── (同上8个文件)
+
+视频号:     /Users/semgilo/Documents/git/VideoCut/runs/<video_id>-<timestamp>/platforms/tecent/
 └── (同上8个文件)
 ```
 
