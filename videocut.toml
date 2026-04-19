@@ -1,7 +1,7 @@
 [pipeline]
 export_platform_materials = true
 cleanup_source_after_publish = true
-output_name = "final_cn.mp4"
+output_name = "final_subtitled.mp4"
 runs_dir = "runs"
 
 [translation]
