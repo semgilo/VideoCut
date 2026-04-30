@@ -173,9 +173,24 @@ def render_final_video(
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     video_codec_args = _build_video_codec_args(video_preset=video_preset, video_crf=video_crf)
+    video_duration = ffprobe_duration(video_path)
     if burn_subtitles and _ffmpeg_has_subtitles_filter():
+        # Build fontsdir argument to avoid fontconfig hangs on macOS.
+        # fontconfig is not the native font system on macOS and known to hang libass
+        # when cache is missing or font name cannot be resolved.
+        fontsdir_arg = ""
+        if subtitle_font_path:
+            font_dir = str(Path(subtitle_font_path).resolve().parent)
+            fontsdir_arg = f":fontsdir='{_escape_filter_path(font_dir)}'"
+        else:
+            # Fallback: macOS system font directory
+            mac_fonts = Path("/System/Library/Fonts")
+            if mac_fonts.is_dir():
+                fontsdir_arg = f":fontsdir='{mac_fonts}'"
+
         subtitle_filter = (
-            f"subtitles=filename='{_escape_filter_path(subtitle_path.resolve())}':"
+            f"subtitles=filename='{_escape_filter_path(subtitle_path.resolve())}'"
+            f"{fontsdir_arg}:"
             f"force_style='FontName={subtitle_font},Fontsize={subtitle_font_size},"
             "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H64000000,"
             "Outline=1,Shadow=0,Alignment=2,MarginV=24'"
@@ -208,10 +223,12 @@ def render_final_video(
             "title=Chinese",
             "-disposition:s:0",
             "default",
-            "-shortest",
+            "-t",
+            f"{video_duration:.3f}",
             str(output_path),
         ]
-        run_command(cmd)
+        run_command(cmd, timeout=_render_timeout(video_path))
+        _verify_video_output(output_path)
         return output_path
 
     if burn_subtitles:
@@ -268,11 +285,13 @@ def render_final_video(
             "title=Chinese",
             "-disposition:s:0",
             "default",
-            "-shortest",
+            "-t",
+            f"{video_duration:.3f}",
             str(output_path),
         ]
     )
-    run_command(cmd)
+    run_command(cmd, timeout=_render_timeout(video_path))
+    _verify_video_output(output_path)
     return output_path
 
 
@@ -388,12 +407,41 @@ def _render_final_video_with_overlay_subtitles(
             "title=Chinese",
             "-disposition:s:0",
             "default",
-            "-shortest",
+            "-t",
+            f"{video_duration:.3f}",
             str(output_path),
         ]
     )
-    run_command(cmd)
+    run_command(cmd, timeout=_render_timeout(video_path))
+    _verify_video_output(output_path)
     return output_path
+
+
+def _verify_video_output(path: Path) -> None:
+    """Check the output video is playable and has the expected streams.
+
+    Called after every ffmpeg render so stalls (watchdog-kill) don't silently
+    produce a truncated file.  Raises RuntimeError if the file is missing,
+    empty, or has no video stream.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        raise RuntimeError(f"Render output missing or empty: {path}")
+
+    duration = ffprobe_duration(path)
+    if duration <= 0:
+        raise RuntimeError(
+            f"Render output has zero/negative duration ({duration}s): {path}"
+        )
+
+
+def _render_timeout(video_path: Path) -> float:
+    """Return a timeout in seconds for ffmpeg render commands, proportional to video duration.
+
+    Shorter timeout helps detect hangs (e.g. -shortest / subtitle mux stall) early.
+    Max 30 min — if encoding takes longer, something is wrong.
+    """
+    duration = ffprobe_duration(video_path)
+    return max(300.0, min(duration * 5, 1800.0))
 
 
 def write_manifest(
@@ -591,3 +639,77 @@ def _resolve_subtitle_font_path(subtitle_font_path: str) -> Path:
         "No subtitle font file could be auto-detected for the Pillow overlay fallback. "
         "Set VIDEOCUT_SUBTITLE_FONT_PATH or pass --subtitle-font-path."
     )
+
+
+def compress_for_publish(
+    input_path: Path,
+    output_path: Path,
+    target_size_mb: int = 500,
+    max_width: int = 1920,
+    max_height: int = 1080,
+) -> Path:
+    """Compress video to target size and resolution using two-pass VBR.
+
+    Uses two-pass encoding to hit the target file size precisely.
+    The bitrate is calculated dynamically based on video duration:
+    - Short videos get higher bitrate (better quality)
+    - Long videos are capped to fit within target_size_mb
+
+    Returns the output path (same as output_path parameter).
+    """
+    if output_path.exists():
+        return output_path
+
+    duration = ffprobe_duration(input_path)
+    if duration <= 0:
+        raise RuntimeError(f"Cannot determine duration of {input_path}")
+
+    audio_bitrate_k = 128
+    total_bitrate_k = int((target_size_mb * 8192) / duration)
+    video_bitrate_k = max(total_bitrate_k - audio_bitrate_k, 100)
+
+    # Scale filter only if needed
+    in_w, in_h = ffprobe_video_size(input_path)
+    if in_w > max_width or in_h > max_height:
+        scale = (
+            f"scale='min({max_width},iw)':'min({max_height},ih)':"
+            f"force_original_aspect_ratio=decrease"
+        )
+    else:
+        scale = "null"
+
+    # Pass 1: analysis
+    run_command(
+        [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c:v", "libx264", "-preset", "slow",
+            "-b:v", f"{video_bitrate_k}k",
+            "-vf", scale,
+            "-pass", "1", "-an", "-f", "mp4", "/dev/null",
+        ],
+        log_command=True,
+    )
+
+    # Pass 2: encoding
+    run_command(
+        [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c:v", "libx264", "-preset", "slow",
+            "-b:v", f"{video_bitrate_k}k",
+            "-vf", scale,
+            "-c:a", "aac", "-b:a", f"{audio_bitrate_k}k",
+            "-movflags", "+faststart",
+            "-pass", "2", str(output_path),
+        ],
+        log_command=True,
+    )
+
+    # Clean up analysis files
+    for f in (input_path.parent / "ffmpeg2pass-0.log",
+              input_path.parent / "ffmpeg2pass-0.log.mbtree"):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return output_path

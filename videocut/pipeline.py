@@ -6,11 +6,13 @@ from videocut.config import PipelineConfig
 from videocut.downloader import download_youtube_assets
 from videocut.media import (
     compose_dubbed_track,
+    compress_for_publish,
     measure_synthesized_segments,
     render_final_video,
     write_manifest,
 )
 from videocut.publish import export_publish_assets
+from videocut.shell import step, step_guard
 from videocut.subtitles import load_segments_from_vtt, write_srt
 from videocut.timing import schedule_dubbing_timing
 from videocut.translate import (
@@ -23,7 +25,7 @@ from videocut.tts import synthesize_segments
 
 
 def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) -> Path:
-    run_dir = workdir or _make_run_dir(config.runs_dir)
+    run_dir = workdir.expanduser().resolve() if workdir else _make_run_dir(config.runs_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     source_dir = run_dir / "source"
@@ -32,7 +34,7 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     audio_dir = run_dir / "audio"
 
     print(f"Working directory: {run_dir}")
-    print("Step 1/10: downloading video and subtitle assets...")
+    step("Step 1/10 download-assets")
     download = download_youtube_assets(
         url=url,
         source_dir=source_dir,
@@ -45,13 +47,13 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
             "This unified pipeline requires an English subtitle source."
         )
 
-    print("Step 2/10: parsing English subtitles...")
+    step("Step 2/10 parse-english-subtitles")
     segments = load_segments_from_vtt(download.english_subtitle_path)
     if not segments:
         raise RuntimeError(f"No subtitle segments were parsed from {download.english_subtitle_path}")
     print(f"Segments ready: {len(segments)}")
 
-    print("Step 3/10: translating with local LLM (batch=10, L/V char budget)...")
+    step("Step 3/10 translate-llm")
     if not llm_translation_enabled(
         base_url=config.llm_base_url,
         model=config.llm_model,
@@ -84,7 +86,7 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     )
     translator.translate(segments)
 
-    print("Step 4/10: synthesizing Chinese dubbing with CosyVoice...")
+    step("Step 4/10 synthesize-tts")
     synthesize_segments(
         segments=segments,
         output_dir=tts_dir,
@@ -92,10 +94,10 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         source_video=download.video_path,
     )
 
-    print("Step 5/10: measuring synthesized segment durations...")
+    step("Step 5/10 measure-tts-durations")
     measure_synthesized_segments(segments)
 
-    print("Step 6/10: planning timing via per-segment stretch/compress alignment...")
+    step("Step 6/10 schedule-timing")
     schedule_dubbing_timing(segments)
     first_spoken_at = min(segment.render_start for segment in segments)
     max_rate = max(segment.playback_rate for segment in segments)
@@ -105,12 +107,12 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         f"playback-rate range {min_rate:.2f}x ~ {max_rate:.2f}x"
     )
 
-    print("Step 7/10: generating bilingual SRT...")
+    step("Step 7/10 write-bilingual-srt")
     generated_srt = subtitles_dir / "zh.srt"
     write_srt(generated_srt, segments, bilingual=True)
     print(f"Bilingual subtitle file generated: {generated_srt}")
 
-    print("Step 8/10: composing dubbed audio track (ffmpeg-full)...")
+    step("Step 8/10 compose-dubbed-audio")
     dubbed_track = compose_dubbed_track(
         video_path=download.video_path,
         segments=segments,
@@ -120,7 +122,7 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     )
     print(f"Dubbed audio track generated: {dubbed_track}")
 
-    print("Step 9/10: rendering final video (ffmpeg-full)...")
+    step("Step 9/10 render-final-video")
     final_video = render_final_video(
         video_path=download.video_path,
         dubbed_track_path=dubbed_track,
@@ -135,13 +137,19 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         subtitle_overlay_concurrency=config.subtitle_overlay_concurrency,
     )
 
-    print("Step 10/10: translating metadata and exporting publish assets...")
+    step("Step 10/11 compress-for-publish")
+    compress_for_publish(
+        input_path=final_video,
+        output_path=run_dir / "final_compressed.mp4",
+        target_size_mb=500,
+        max_width=1920,
+        max_height=1080,
+    )
+
+    step("Step 11/11 translate-meta-and-export")
     localized_metadata = download.source_metadata
     if download.source_metadata is not None:
-        try:
-            localized_metadata = translator.translate_metadata(download.source_metadata)
-        except Exception as error:
-            print(f"Warning: metadata translation failed, keeping original metadata: {error}")
+        localized_metadata = _translate_metadata_partial(translator, download.source_metadata)
     else:
         print("Warning: source metadata was not downloaded, publish assets will be partial.")
 
@@ -152,6 +160,16 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         cover_image_path=download.thumbnail_path,
         final_video=final_video,
     )
+    if config.export_platform_materials:
+        _export_platform_materials(
+            run_dir=run_dir,
+            final_video=final_video,
+            subtitle_path=generated_srt,
+            subtitle_segments=segments,
+            publish_assets=publish_assets,
+            source_metadata=download.source_metadata,
+            localized_metadata=localized_metadata,
+        )
     write_manifest(
         path=run_dir / "manifest.json",
         source_video=download.video_path,
@@ -177,8 +195,104 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     return final_video
 
 
-def _make_run_dir(runs_dir: Path) -> Path:
-    from datetime import datetime
+def _translate_metadata_partial(
+    translator: "OpenAICompatibleTranslator",
+    source: "VideoMetadata",
+) -> "VideoMetadata":
+    """逐字段翻译元数据，每个字段独立降级——失败时保留原文，不影响其他字段。"""
+    from videocut.models import VideoMetadata
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return runs_dir / timestamp
+    def _try_field(field_name: str, text: str) -> str:
+        if not text.strip():
+            return text
+        try:
+            result = translator._translate_single_metadata_field(field_name, text)
+            print(f"  metadata [{field_name}] translated OK")
+            return result
+        except Exception as err:
+            print(f"  Warning: metadata [{field_name}] translation failed, keeping original: {err}")
+            return text
+
+    def _try_tags(tags: list[str]) -> list[str]:
+        if not tags:
+            return tags
+        translated = []
+        for tag in tags:
+            try:
+                translated.append(translator._translate_single_metadata_field("tag", tag))
+            except Exception:
+                translated.append(tag)
+        return translated
+
+    title = _try_field("title", source.title)
+    description = _try_field("description", source.description)
+    tags = _try_tags(source.tags)
+
+    return VideoMetadata(
+        title=title,
+        description=description,
+        tags=tags,
+        uploader=source.uploader,
+        channel=source.channel,
+        video_id=source.video_id,
+        webpage_url=source.webpage_url,
+        upload_date=source.upload_date,
+    )
+
+
+def _export_platform_materials(
+    run_dir: Path,
+    final_video: Path,
+    subtitle_path: Path,
+    subtitle_segments: "list[Segment] | None",
+    publish_assets: dict[str, str | None],
+    source_metadata: "VideoMetadata | None",
+    localized_metadata: "VideoMetadata | None",
+) -> None:
+    from videocut.subtitle_only import _collect_video_profile, _export_platform_kits
+
+    platforms_dir = run_dir / "platforms"
+    video_profile = _collect_video_profile(final_video)
+    _export_platform_kits(
+        output_dir=platforms_dir,
+        final_video=final_video,
+        subtitle_path=subtitle_path,
+        publish_assets=publish_assets,
+        source_metadata=source_metadata,
+        localized_metadata=localized_metadata,
+        video_profile=video_profile,
+        subtitle_segments=subtitle_segments,
+    )
+    print(f"Platform kits exported: {platforms_dir}")
+
+
+def _make_run_dir(runs_dir: Path) -> Path:
+    import secrets
+    import string
+    import time
+
+    runs_root = runs_dir.expanduser().resolve()
+    runs_root.mkdir(parents=True, exist_ok=True)
+    alphabet = string.ascii_lowercase + string.digits
+
+    for _ in range(20):
+        timestamp_ms = int(time.time() * 1000)
+        left = _to_base36(timestamp_ms)
+        right = "".join(secrets.choice(alphabet) for _ in range(6))
+        candidate = runs_root / f"run_{left}_{right}-processed"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Failed to allocate a unique run directory name.")
+
+
+def _to_base36(value: int) -> str:
+    if value < 0:
+        raise ValueError("Base36 encoding only supports non-negative integers.")
+    if value == 0:
+        return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    encoded: list[str] = []
+    while value:
+        value, remainder = divmod(value, 36)
+        encoded.append(digits[remainder])
+    return "".join(reversed(encoded))
