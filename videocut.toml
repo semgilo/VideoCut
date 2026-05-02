@@ -1,8 +1,9 @@
 [pipeline]
-export_platform_materials = true
+# export_platform_materials is deprecated — unified publish/ is always generated
 cleanup_source_after_publish = true
-output_name = "final_subtitled.mp4"
-runs_dir = "runs"
+output_name = "final_subtitled.mp4"  # 渲染中间文件，压缩后最终产物为 final_compressed.mp4
+runs_dir = "~/.openclaw/tmp/"
+compress_to_max_mb = 500
 
 [translation]
 llm_base_url = "http://127.0.0.1:8888/v1"
@@ -14,16 +15,6 @@ concurrency = 4
 target_cps = 4.5
 char_tolerance = 0.2
 protected_terms_path = "translation_protected_terms.txt"
-
-[cosyvoice]
-python = "./.venv-cosyvoice/bin/python"
-repo_dir = ".vendor/CosyVoice"
-model_dir = ".vendor/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B"
-mode = "cross_lingual"
-group_size = 4
-concurrency = 1
-reference_audio_path = ""
-reference_text = ""
 
 [audio]
 original_volume = 0.0

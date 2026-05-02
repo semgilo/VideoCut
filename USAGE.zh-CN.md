@@ -169,13 +169,18 @@ videocut inpaint input.mp4 output.mp4 \
 
 ## 6. 输出目录
 `runs/<timestamp>/`（或你指定的 `--workdir`）下会生成：
+
+### 核心产物 ⭐
+- `final_compressed.mp4` — 最终发布视频（manifest.json 中 `final_video` 指向此文件）
+- `publish/` — 统一发布素材（title.txt, description.txt, tags.txt, cover.jpg, metadata.json）
+- `manifest.json` — 唯一数据源，所有下游代码从此读取路径
+
+### 中间产物（cleanup 后可删除）
 - `source/` 原视频与字幕
 - `tts/` 分段 CosyVoice 音频
 - `subtitles/zh.srt` 双语字幕
 - `audio/dubbed_track.m4a` 配音轨
-- `final_cn.mp4` 最终视频
-- `manifest.json` 全流程清单
-- `platforms/` 平台发布资产（标题、描述、标签、封面等）
+- `platforms/` 旧版平台目录（已由 publish/ 取代）
 
 ## 7. 性能建议
 - 翻译（本地 LLM）：
