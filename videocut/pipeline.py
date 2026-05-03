@@ -138,13 +138,19 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     )
 
     step("Step 10/11 compress-for-publish")
-    compress_for_publish(
-        input_path=final_video,
-        output_path=run_dir / "final_compressed.mp4",
-        target_size_mb=500,
-        max_width=1920,
-        max_height=1080,
-    )
+    if config.compress_to_max_mb > 0:
+        compressed_video = run_dir / "final_video.mp4"
+        compress_for_publish(
+            input_path=final_video,
+            output_path=compressed_video,
+            target_size_mb=config.compress_to_max_mb,
+            max_width=1920,
+            max_height=1080,
+        )
+        final_video = compressed_video
+        print(f"Compressed for publish ({config.compress_to_max_mb}MB target): {final_video}")
+    else:
+        print("Skipping compression (compress_to_max_mb is 0).")
 
     step("Step 11/11 translate-meta-and-export")
     localized_metadata = download.source_metadata
@@ -160,16 +166,6 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
         cover_image_path=download.thumbnail_path,
         final_video=final_video,
     )
-    if config.export_platform_materials:
-        _export_platform_materials(
-            run_dir=run_dir,
-            final_video=final_video,
-            subtitle_path=generated_srt,
-            subtitle_segments=segments,
-            publish_assets=publish_assets,
-            source_metadata=download.source_metadata,
-            localized_metadata=localized_metadata,
-        )
     write_manifest(
         path=run_dir / "manifest.json",
         source_video=download.video_path,
@@ -186,11 +182,9 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     print(f"Final video exported: {final_video}")
 
     if config.cleanup_source_after_publish:
-        import shutil
+        from videocut.subtitle_only import _cleanup_intermediate_files
 
-        if source_dir.exists():
-            shutil.rmtree(source_dir)
-            print(f"Source directory cleaned up: {source_dir}")
+        _cleanup_intermediate_files(run_dir, final_video)
 
     return final_video
 
@@ -240,59 +234,17 @@ def _translate_metadata_partial(
     )
 
 
-def _export_platform_materials(
-    run_dir: Path,
-    final_video: Path,
-    subtitle_path: Path,
-    subtitle_segments: "list[Segment] | None",
-    publish_assets: dict[str, str | None],
-    source_metadata: "VideoMetadata | None",
-    localized_metadata: "VideoMetadata | None",
-) -> None:
-    from videocut.subtitle_only import _collect_video_profile, _export_platform_kits
-
-    platforms_dir = run_dir / "platforms"
-    video_profile = _collect_video_profile(final_video)
-    _export_platform_kits(
-        output_dir=platforms_dir,
-        final_video=final_video,
-        subtitle_path=subtitle_path,
-        publish_assets=publish_assets,
-        source_metadata=source_metadata,
-        localized_metadata=localized_metadata,
-        video_profile=video_profile,
-        subtitle_segments=subtitle_segments,
-    )
-    print(f"Platform kits exported: {platforms_dir}")
-
-
 def _make_run_dir(runs_dir: Path) -> Path:
-    import secrets
-    import string
-    import time
+    from datetime import datetime
 
     runs_root = runs_dir.expanduser().resolve()
     runs_root.mkdir(parents=True, exist_ok=True)
-    alphabet = string.ascii_lowercase + string.digits
 
     for _ in range(20):
-        timestamp_ms = int(time.time() * 1000)
-        left = _to_base36(timestamp_ms)
-        right = "".join(secrets.choice(alphabet) for _ in range(6))
-        candidate = runs_root / f"run_{left}_{right}-processed"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        candidate = runs_root / f"mc-{stamp}"
         if not candidate.exists():
             return candidate
     raise RuntimeError("Failed to allocate a unique run directory name.")
 
 
-def _to_base36(value: int) -> str:
-    if value < 0:
-        raise ValueError("Base36 encoding only supports non-negative integers.")
-    if value == 0:
-        return "0"
-    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-    encoded: list[str] = []
-    while value:
-        value, remainder = divmod(value, 36)
-        encoded.append(digits[remainder])
-    return "".join(reversed(encoded))

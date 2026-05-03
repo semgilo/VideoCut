@@ -25,6 +25,8 @@ def _default_cosyvoice_python() -> str:
 
 @dataclass(slots=True)
 class PipelineConfig:
+    mode: str = os.getenv("VIDEOCUT_MODE", "subtitle_only")  # "subtitle_only" or "voice_clone"
+    translation_backend: str = os.getenv("VIDEOCUT_TRANSLATION_BACKEND", "llm")  # "llm" or "google"
     export_platform_materials: bool = os.getenv("VIDEOCUT_EXPORT_PLATFORM_MATERIALS", "1") != "0"
     cleanup_source_after_publish: bool = os.getenv("VIDEOCUT_CLEANUP_SOURCE_AFTER_PUBLISH", "1") != "0"
 
@@ -36,6 +38,10 @@ class PipelineConfig:
     translation_concurrency: int = int(os.getenv("VIDEOCUT_TRANSLATION_CONCURRENCY", "1"))
     translation_target_cps: float = float(os.getenv("VIDEOCUT_TRANSLATION_TARGET_CPS", "4.5"))
     translation_char_tolerance: float = float(os.getenv("VIDEOCUT_TRANSLATION_CHAR_TOLERANCE", "0.2"))
+    min_playback_rate: float | None = None
+    max_playback_rate: float | None = None
+    translation_enforce_char_budget: bool = False
+    translation_budget_refine_passes: int = 1
     protected_terms_path: str = os.getenv(
         "VIDEOCUT_PROTECTED_TERMS_PATH",
         str(_repo_root() / "translation_protected_terms.txt"),
@@ -45,6 +51,8 @@ class PipelineConfig:
     cosyvoice_repo_dir: str = os.getenv("VIDEOCUT_COSYVOICE_REPO_DIR", "")
     cosyvoice_model_dir: str = os.getenv("VIDEOCUT_COSYVOICE_MODEL_DIR", "")
     cosyvoice_mode: str = os.getenv("VIDEOCUT_COSYVOICE_MODE", "cross_lingual")
+    enable_voice_clone: bool = os.getenv("VIDEOCUT_ENABLE_VOICE_CLONE", "1") != "0"
+    cosyvoice_speaker: str = os.getenv("VIDEOCUT_COSYVOICE_SPEAKER", "")
     cosyvoice_group_size: int = int(os.getenv("VIDEOCUT_COSYVOICE_GROUP_SIZE", "1"))
     cosyvoice_concurrency: int = int(os.getenv("VIDEOCUT_COSYVOICE_CONCURRENCY", "1"))
     reference_audio_path: str = os.getenv("VIDEOCUT_REFERENCE_AUDIO_PATH", "")
@@ -61,20 +69,28 @@ class PipelineConfig:
     video_preset: str = os.getenv("VIDEOCUT_VIDEO_PRESET", "medium")
     video_crf: int = int(os.getenv("VIDEOCUT_VIDEO_CRF", "20"))
 
-    runs_dir: Path = Path("runs")
-    output_name: str = "final_cn.mp4"
+    asr_model: str = os.getenv("VIDEOCUT_ASR_MODEL", "medium")
+    asr_device: str = os.getenv("VIDEOCUT_ASR_DEVICE", "cpu")
+    asr_compute_type: str = os.getenv("VIDEOCUT_ASR_COMPUTE_TYPE", "int8")
+
+    runs_dir: Path = Path("~/.openclaw/tmp/mc-runs/").expanduser()
+    compress_to_max_mb: int = int(os.getenv("VIDEOCUT_COMPRESS_TO_MAX_MB", "500"))
+    output_name: str = "final_video.mp4"
 
 
 DEFAULT_CONFIG_PATH = Path("videocut.toml")
 
 _SECTION_FIELD_MAP: dict[str, dict[str, str]] = {
     "pipeline": {
+        "mode": "mode",
         "export_platform_materials": "export_platform_materials",
         "cleanup_source_after_publish": "cleanup_source_after_publish",
         "output_name": "output_name",
         "runs_dir": "runs_dir",
+        "compress_to_max_mb": "compress_to_max_mb",
     },
     "translation": {
+        "backend": "translation_backend",
         "llm_base_url": "llm_base_url",
         "llm_api_key": "llm_api_key",
         "llm_model": "llm_model",
@@ -83,6 +99,10 @@ _SECTION_FIELD_MAP: dict[str, dict[str, str]] = {
         "concurrency": "translation_concurrency",
         "target_cps": "translation_target_cps",
         "char_tolerance": "translation_char_tolerance",
+        "min_playback_rate": "min_playback_rate",
+        "max_playback_rate": "max_playback_rate",
+        "enforce_char_budget": "translation_enforce_char_budget",
+        "budget_refine_passes": "translation_budget_refine_passes",
         "protected_terms_path": "protected_terms_path",
     },
     "cosyvoice": {
@@ -90,6 +110,8 @@ _SECTION_FIELD_MAP: dict[str, dict[str, str]] = {
         "repo_dir": "cosyvoice_repo_dir",
         "model_dir": "cosyvoice_model_dir",
         "mode": "cosyvoice_mode",
+        "voice_clone": "enable_voice_clone",
+        "speaker": "cosyvoice_speaker",
         "group_size": "cosyvoice_group_size",
         "concurrency": "cosyvoice_concurrency",
         "reference_audio_path": "reference_audio_path",

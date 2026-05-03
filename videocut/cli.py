@@ -7,6 +7,35 @@ from videocut.config import PipelineConfig, load_pipeline_config
 from videocut.cover import compose_cover_with_title
 from videocut.inpaint import InpaintMethod, inpaint_video, inpaint_video_ffmpeg, parse_region
 from videocut.pipeline import run_pipeline
+from videocut.shell import step_guard
+from videocut.subtitle_only import run_subtitle_only_pipeline
+
+
+def _add_clean_runs_parser(subparsers) -> None:
+    parser = subparsers.add_parser("clean-runs", help="Clean old run directories")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Optional TOML config file to read runs_dir from.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--keep-days",
+        type=int,
+        default=7,
+        help="Keep runs newer than this many days (default: 7). Implied when neither --all nor --keep-days given.",
+    )
+    mode.add_argument("--all", action="store_true", dest="all_runs", help="Clean ALL run directories")
+    parser.add_argument(
+        "--force", action="store_true", help="Actually delete (default is dry-run)"
+    )
+    return parser
+
+
+def _add_doctor_parser(subparsers) -> None:
+    parser = subparsers.add_parser("doctor", help="Check system configuration and status")
+    parser.add_argument("--config", type=Path, help="Optional TOML config file to validate")
+    return parser
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -163,6 +192,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Expand the inpaint mask by this many pixels to avoid border rings (default: 2).",
     )
 
+    # ------------------------------------------------------------------
+    # doctor – system diagnostics
+    # ------------------------------------------------------------------
+    _add_doctor_parser(subparsers)
+
+    # ------------------------------------------------------------------
+    # clean-runs – clean up old run directories
+    # ------------------------------------------------------------------
+    _add_clean_runs_parser(subparsers)
+
     cover_parser = subparsers.add_parser("cover", help="Compose a cover image with title and background box")
     cover_parser.add_argument("--input", type=Path, required=True, help="Source image path")
     cover_parser.add_argument("--output", type=Path, required=True, help="Output image path")
@@ -193,7 +232,12 @@ def main() -> None:
     if args.command == "run":
         config = load_pipeline_config(args.config)
         _apply_run_overrides(config, args)
-        run_pipeline(args.url, config, workdir=args.workdir)
+        # Route to the correct pipeline based on mode
+        with step_guard():
+            if config.mode == "subtitle_only":
+                run_subtitle_only_pipeline(args.url, config, workdir=args.workdir)
+            else:
+                run_pipeline(args.url, config, workdir=args.workdir)
         return
 
     if args.command == "inpaint":
@@ -267,6 +311,25 @@ def main() -> None:
         )
         print(f"Cover generated: {output_path}")
         return
+
+    if args.command == "doctor":
+        from videocut.doctor import run_doctor
+
+        raise SystemExit(run_doctor(config_path=args.config))
+
+    if args.command == "clean-runs":
+        from videocut.clean_runs import run_clean_runs
+
+        # load_pipeline_config already imported at module level (line 6)
+        config = load_pipeline_config(args.config)
+        raise SystemExit(
+            run_clean_runs(
+                config.runs_dir,
+                keep_days=args.keep_days,
+                all_=args.all_runs,
+                force=args.force,
+            )
+        )
 
 
 def _apply_run_overrides(config: PipelineConfig, args: argparse.Namespace) -> None:
