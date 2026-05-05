@@ -198,16 +198,17 @@ def run_subtitle_only_pipeline(
 
     with stage("compress-for-publish"):
         if config.compress_to_max_mb > 0:
-            compressed_video = run_dir / "final_video.mp4"
+            compressed_path = run_dir / "final_compressed.mp4"
             compress_for_publish(
                 input_path=final_video,
-                output_path=compressed_video,
+                output_path=compressed_path,
                 target_size_mb=config.compress_to_max_mb,
                 max_width=1920,
                 max_height=1080,
             )
-            final_video = compressed_video
-            print(f"Compressed for publish ({config.compress_to_max_mb}MB target): {final_video}")
+            final_video.unlink()
+            final_video = compressed_path
+            print(f"Compressed for publish ({config.compress_to_max_mb}MB target): {final_video.name}")
         else:
             print("Skipping compression (compress_to_max_mb is 0).")
 
@@ -248,7 +249,7 @@ def run_subtitle_only_pipeline(
 
     with stage("cleanup-intermediate-files"):
         if config.cleanup_source_after_publish:
-            _cleanup_intermediate_files(run_dir, final_video)
+            _cleanup_intermediate_files(run_dir)
 
     return final_video
 
@@ -398,9 +399,16 @@ def _translate_metadata_with_llm(
             continue
         translated_tags.append(_translate_field("tag", normalized))
 
+    title = _translate_field("title", metadata.title)
+    try:
+        description = translator._generate_description(title, translated_tags)
+    except Exception as error:
+        print(f"Warning: description generation failed: {error}")
+        description = ""
+
     return VideoMetadata(
-        title=_translate_field("title", metadata.title),
-        description=_translate_field("description", metadata.description),
+        title=title,
+        description=description,
         tags=translated_tags,
         uploader=metadata.uploader,
         channel=metadata.channel,
@@ -410,26 +418,32 @@ def _translate_metadata_with_llm(
     )
 
 
-def _cleanup_intermediate_files(run_dir: Path, final_video: Path) -> None:
+def _cleanup_intermediate_files(run_dir: Path) -> None:
+    import json
     import shutil
 
-    for dir_name in ("source", "audio", "platforms"):
+    for dir_name in ("source", "audio", "platforms", "subtitles"):
         target = run_dir / dir_name
         if target.exists():
             shutil.rmtree(target)
             print(f"Cleaned up: {target}")
 
-    # Delete uncompressed final video if a compressed version exists
-    compressed = run_dir / "final_compressed.mp4"
-    subtitled = run_dir / "final_subtitled.mp4"
-    if compressed.exists() and subtitled.exists() and str(final_video) != str(subtitled):
-        subtitled.unlink()
-        print(f"Cleaned up uncompressed video: {subtitled}")
-
     summary = run_dir / "delivery_summary.md"
     if summary.exists():
         summary.unlink()
         print(f"Cleaned up: {summary}")
+
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        pruned = {
+            "final_video": manifest.get("final_video"),
+            "publish_assets": manifest.get("publish_assets", {}),
+            "source_metadata": manifest.get("source_metadata"),
+            "localized_metadata": manifest.get("localized_metadata"),
+        }
+        manifest_path.write_text(json.dumps(pruned, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("Pruned manifest.json")
 
     print("Intermediate files have been cleaned up.")
 

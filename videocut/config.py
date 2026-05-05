@@ -27,7 +27,6 @@ def _default_cosyvoice_python() -> str:
 class PipelineConfig:
     mode: str = os.getenv("VIDEOCUT_MODE", "subtitle_only")  # "subtitle_only" or "voice_clone"
     translation_backend: str = os.getenv("VIDEOCUT_TRANSLATION_BACKEND", "llm")  # "llm" or "google"
-    export_platform_materials: bool = os.getenv("VIDEOCUT_EXPORT_PLATFORM_MATERIALS", "1") != "0"
     cleanup_source_after_publish: bool = os.getenv("VIDEOCUT_CLEANUP_SOURCE_AFTER_PUBLISH", "1") != "0"
 
     llm_base_url: str = os.getenv("VIDEOCUT_LLM_BASE_URL", "http://localhost:1234/v1")
@@ -73,7 +72,7 @@ class PipelineConfig:
     asr_device: str = os.getenv("VIDEOCUT_ASR_DEVICE", "cpu")
     asr_compute_type: str = os.getenv("VIDEOCUT_ASR_COMPUTE_TYPE", "int8")
 
-    runs_dir: Path = Path("~/.openclaw/tmp/mc-runs/").expanduser()
+    runs_dir: Path = Path("runs")
     compress_to_max_mb: int = int(os.getenv("VIDEOCUT_COMPRESS_TO_MAX_MB", "500"))
     output_name: str = "final_video.mp4"
 
@@ -83,7 +82,6 @@ DEFAULT_CONFIG_PATH = Path("videocut.toml")
 _SECTION_FIELD_MAP: dict[str, dict[str, str]] = {
     "pipeline": {
         "mode": "mode",
-        "export_platform_materials": "export_platform_materials",
         "cleanup_source_after_publish": "cleanup_source_after_publish",
         "output_name": "output_name",
         "runs_dir": "runs_dir",

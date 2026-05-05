@@ -139,16 +139,17 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
 
     step("Step 10/11 compress-for-publish")
     if config.compress_to_max_mb > 0:
-        compressed_video = run_dir / "final_video.mp4"
+        compressed_path = run_dir / "final_compressed.mp4"
         compress_for_publish(
             input_path=final_video,
-            output_path=compressed_video,
+            output_path=compressed_path,
             target_size_mb=config.compress_to_max_mb,
             max_width=1920,
             max_height=1080,
         )
-        final_video = compressed_video
-        print(f"Compressed for publish ({config.compress_to_max_mb}MB target): {final_video}")
+        final_video.unlink()
+        final_video = compressed_path
+        print(f"Compressed for publish ({config.compress_to_max_mb}MB target): {final_video.name}")
     else:
         print("Skipping compression (compress_to_max_mb is 0).")
 
@@ -184,7 +185,7 @@ def run_pipeline(url: str, config: PipelineConfig, workdir: Path | None = None) 
     if config.cleanup_source_after_publish:
         from videocut.subtitle_only import _cleanup_intermediate_files
 
-        _cleanup_intermediate_files(run_dir, final_video)
+        _cleanup_intermediate_files(run_dir)
 
     return final_video
 

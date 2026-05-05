@@ -1,8 +1,6 @@
 [pipeline]
-# export_platform_materials is deprecated — unified publish/ is always generated
 cleanup_source_after_publish = true
 output_name = "final_subtitled.mp4"  # 渲染中间文件，压缩后最终产物为 final_compressed.mp4
-runs_dir = "~/.openclaw/tmp/mc-runs/"
 compress_to_max_mb = 500
 
 [translation]

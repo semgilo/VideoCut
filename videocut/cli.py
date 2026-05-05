@@ -5,7 +5,6 @@ from pathlib import Path
 
 from videocut.config import PipelineConfig, load_pipeline_config
 from videocut.cover import compose_cover_with_title
-from videocut.inpaint import InpaintMethod, inpaint_video, inpaint_video_ffmpeg, parse_region
 from videocut.pipeline import run_pipeline
 from videocut.shell import step_guard
 from videocut.subtitle_only import run_subtitle_only_pipeline
@@ -16,8 +15,9 @@ def _add_clean_runs_parser(subparsers) -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        help="Optional TOML config file to read runs_dir from.",
+        help="Optional TOML config file.",
     )
+    parser.add_argument("--runs-dir", type=Path, dest="runs_dir", help="Root directory for runs (default: ./runs)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--keep-days",
@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional TOML config file. If omitted, videocut.toml in the current directory is loaded automatically when present.",
     )
     run_parser.add_argument("--workdir", type=Path, help="Custom working directory for this run")
+    run_parser.add_argument("--runs-dir", type=Path, dest="runs_dir", help="Root directory for all runs (default: ./runs)")
     run_parser.add_argument("--output-name", help="Final output filename written inside the run directory")
 
     run_parser.add_argument("--llm-base-url", help="OpenAI-compatible base URL for local translation model")
@@ -107,13 +108,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Burn subtitles into the final video.",
     )
     run_parser.add_argument(
-        "--platform-materials",
-        dest="platform_materials",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Export platform-specific publish materials for Douyin, Bilibili, Xiaohongshu, and Tecent (WeChat Channels).",
-    )
-    run_parser.add_argument(
         "--cleanup-source",
         dest="cleanup_source",
         action=argparse.BooleanOptionalAction,
@@ -158,8 +152,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     inpaint_parser.add_argument(
         "--method",
-        choices=[m.value for m in InpaintMethod],
-        default=InpaintMethod.TELEA.value,
+        choices=["telea", "ns", "lama"],
+        default="telea",
         help=(
             "Inpainting algorithm: "
             "telea (fast marching, default), "
@@ -241,6 +235,8 @@ def main() -> None:
         return
 
     if args.command == "inpaint":
+        from videocut.inpaint import InpaintMethod, inpaint_video, inpaint_video_ffmpeg, parse_region
+
         regions = []
         for r in args.regions:
             try:
@@ -252,18 +248,16 @@ def main() -> None:
                 "Provide at least one of: --region X,Y,W,H, --mask FILE, or --scratch."
             )
 
-        # If only static regions are requested and opencv is absent, use the
-        # ffmpeg delogo fast-path which has no extra Python dependencies.
         use_ffmpeg_path = (
             regions
             and args.mask is None
             and not args.auto_scratch
-            and args.method == InpaintMethod.TELEA.value  # default = no explicit override
+            and args.method == InpaintMethod.TELEA.value
         )
         if use_ffmpeg_path:
             try:
                 import cv2  # noqa: F401
-                use_ffmpeg_path = False  # opencv available → use full path
+                use_ffmpeg_path = False
             except ImportError:
                 pass
 
@@ -320,11 +314,11 @@ def main() -> None:
     if args.command == "clean-runs":
         from videocut.clean_runs import run_clean_runs
 
-        # load_pipeline_config already imported at module level (line 6)
         config = load_pipeline_config(args.config)
+        runs_dir = args.runs_dir if args.runs_dir is not None else config.runs_dir
         raise SystemExit(
             run_clean_runs(
-                config.runs_dir,
+                runs_dir,
                 keep_days=args.keep_days,
                 all_=args.all_runs,
                 force=args.force,
@@ -334,6 +328,7 @@ def main() -> None:
 
 def _apply_run_overrides(config: PipelineConfig, args: argparse.Namespace) -> None:
     for field_name, value in (
+        ("runs_dir", args.runs_dir),
         ("output_name", args.output_name),
         ("cosyvoice_python", args.cosyvoice_python),
         ("cosyvoice_mode", args.cosyvoice_mode),
@@ -353,7 +348,6 @@ def _apply_run_overrides(config: PipelineConfig, args: argparse.Namespace) -> No
     ):
         _apply_override(config, field_name, value)
 
-    _apply_override(config, "export_platform_materials", args.platform_materials)
     _apply_override(config, "cleanup_source_after_publish", args.cleanup_source)
     _apply_override(config, "burn_subtitles", args.burn_subtitles)
     _apply_override(config, "cosyvoice_group_size", args.cosyvoice_group_size, lambda value: max(1, value))

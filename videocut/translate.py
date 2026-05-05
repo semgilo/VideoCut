@@ -19,6 +19,24 @@ from videocut.models import Segment, VideoMetadata
 PROTECTED_PLACEHOLDER_TEMPLATE = "[[VC_TERM_{index:04d}]]"
 PLACEHOLDER_VARIANT_RE = re.compile(r"\[\[?VC_TERM_(?P<id>\d{1,4}|xxxx)\]?\]?", re.IGNORECASE)
 
+# Maximum title length in Chinese characters enforced after translation
+TITLE_MAX_CHARS = 20
+
+
+def _enforce_title_limit(text: str, field_hint: str = "title") -> str:
+    """Truncate title text if it exceeds the platform character limit.
+
+    Only applies when *field_hint* indicates a title field. Description,
+    tags, and other metadata pass through untouched.
+    """
+    if field_hint != "title":
+        return text
+    if len(text) <= TITLE_MAX_CHARS:
+        return text
+    truncated = text[:TITLE_MAX_CHARS]
+    print(f"  [{field_hint}] truncated from {len(text)} to {TITLE_MAX_CHARS} chars: \"{truncated}...\"")
+    return truncated.rstrip()
+
 class OpenAICompatibleTranslator:
     def __init__(
         self,
@@ -129,19 +147,18 @@ class OpenAICompatibleTranslator:
             self.protected_terms,
         )
         system_prompt = (
-            "You localize YouTube video metadata into accurate Simplified Chinese. "
-            "Translate the title, description, and tags directly from source text while preserving proper nouns exactly, "
-            "including personal names, brand names, product names, place names, @handles, URLs, "
-            "hashtags, model numbers, and numeric values. Keep the original meaning and tone. "
-            "If placeholder tokens like [[VC_TERM_0001]] appear, copy them exactly and do not translate, "
-            "remove, or rename them. "
-            "Do not invent facts, add marketing filler, or rewrite into new claims. "
+            "You localize YouTube video metadata into Simplified Chinese for Chinese short-video platforms. "
+            "For the title: summarize it into a concise version within 20 Chinese characters. "
+            "This is a hard limit — count carefully. If the source title is longer, "
+            "extract the core meaning in 20 chars or fewer. "
+            "For tags: translate each tag directly from source text, preserving proper nouns exactly "
+            "including personal names, brand names, product names, place names. "
+            "If placeholder tokens like [[VC_TERM_0001]] appear in tags, copy them exactly. "
             "If source tags are empty, return an empty tags list. "
-            'Return JSON only with this shape: {"title":"...","description":"...","tags":["..."]}.'
+            'Return JSON only with this shape: {"title":"...","tags":["..."]}.'
         )
         user_prompt = (
-            "Translate this metadata to Simplified Chinese with strict faithfulness to the source. "
-            "If any [[VC_TERM_xxxx]] token appears, keep it unchanged in the output.\n"
+            "Translate this metadata to Simplified Chinese.\n"
             f"{json.dumps(masked_metadata, ensure_ascii=False)}"
         )
         parsed = self._complete_json(system_prompt, user_prompt)
@@ -154,11 +171,6 @@ class OpenAICompatibleTranslator:
             required_placeholders["title"],
             placeholder_to_term,
         )
-        restored_description = _restore_masked_text(
-            str(parsed.get("description") or metadata.description).strip(),
-            required_placeholders["description"],
-            placeholder_to_term,
-        )
         restored_tags: list[str] = []
         for index, source_tag in enumerate(source_tags):
             raw_tag = str(translated_tags[index]).strip() if index < len(translated_tags) else source_tag
@@ -168,13 +180,14 @@ class OpenAICompatibleTranslator:
                 required_placeholders["tags"][index] if index < len(required_placeholders["tags"]) else [],
                 placeholder_to_term,
             )
-            # Drop any tag that is a bare XML/think tag leaking from the model
             if re.fullmatch(r"</?[a-zA-Z_][a-zA-Z0-9_]*\s*/?>", restored_tag.strip()):
                 continue
             restored_tags.append(restored_tag)
+        title = _enforce_title_limit(restored_title)
+        description = self._generate_description(title, restored_tags)
         return VideoMetadata(
-            title=restored_title,
-            description=restored_description,
+            title=title,
+            description=description,
             tags=restored_tags,
             uploader=metadata.uploader,
             channel=metadata.channel,
@@ -182,6 +195,23 @@ class OpenAICompatibleTranslator:
             webpage_url=metadata.webpage_url,
             upload_date=metadata.upload_date,
         )
+
+    def _generate_description(self, title: str, tags: list[str]) -> str:
+        tags_hint = "、".join(tags[:8]) if tags else ""
+        system_prompt = (
+            "你是一个中文短视频文案助手。根据用户给出的视频标题，输出一段简体中文视频简介。"
+            "要求：只介绍视频内容，不超过100个汉字，不含任何网址、联系方式、广告或推广内容。"
+            'Return JSON with this shape: {"description": "..."}. No other keys.'
+        )
+        user_parts = [f"视频标题：{title}"]
+        if tags_hint:
+            user_parts.append(f"相关标签：{tags_hint}")
+        user_prompt = "\n".join(user_parts)
+        parsed = self._complete_json(system_prompt, user_prompt)
+        result = _strip_think_blocks(str(parsed.get("description") or "")).strip()
+        if len(result) > 100:
+            result = result[:100]
+        return result
     def _translate_with_completion_model(self, segments: list[Segment]) -> None:
         if not segments:
             return
@@ -334,13 +364,14 @@ class OpenAICompatibleTranslator:
         term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
         # 第一次尝试：带 placeholder 保护
         try:
-            return _translate_completion_field(
+            result = _translate_completion_field(
                 translator=self,
                 text=text,
                 field_name=field_name,
                 term_to_placeholder=term_to_placeholder,
                 placeholder_to_term=placeholder_to_term,
             )
+            return _enforce_title_limit(result, field_name)
         except RuntimeError as first_err:
             print(f"  [{field_name}] placeholder-protected translation failed ({first_err}), retrying without protection...")
         # 降级：直接翻译，不使用 placeholder，接受保护词可能被模型处理
@@ -350,7 +381,7 @@ class OpenAICompatibleTranslator:
         cleaned = _clean_completion_translation(completion)
         if not cleaned:
             raise RuntimeError(f"Completion returned empty text for metadata field {field_name}")
-        return cleaned
+        return _enforce_title_limit(cleaned, field_name)
 
     def _translate_metadata_with_completion_model(self, metadata: VideoMetadata) -> VideoMetadata:
         term_to_placeholder, placeholder_to_term = _build_placeholder_maps(self.protected_terms)
@@ -363,11 +394,17 @@ class OpenAICompatibleTranslator:
         )
         description = _translate_completion_field(
             translator=self,
-            text=metadata.description,
+            text=metadata.title,
             field_name="description",
             term_to_placeholder=term_to_placeholder,
             placeholder_to_term=placeholder_to_term,
         )
+        description = _strip_think_blocks(description)
+        if len(description) > 100:
+            description = description[:100]
+        if not description:
+            print("Warning: description generation returned empty")
+
         tags = [
             _translate_completion_field(
                 translator=self,
@@ -379,6 +416,7 @@ class OpenAICompatibleTranslator:
             for tag in metadata.tags
             if tag.strip()
         ]
+        title = _enforce_title_limit(title)
         return VideoMetadata(
             title=title,
             description=description,
@@ -503,17 +541,21 @@ class OpenAICompatibleTranslator:
         last_error: Exception | None = None
         for attempt in range(1, 5):
             try:
+                url = f"{self.base_url}/chat/completions"
+                print(f"[TRANSLATOR DEBUG] POST {url} attempt {attempt}/4 headers={headers} payload_model={payload.get('model')}")
                 response = requests.post(
-                    f"{self.base_url}/chat/completions",
+                    url,
                     headers=headers,
                     json=payload,
                     timeout=self.timeout,
                 )
+                print(f"[TRANSLATOR DEBUG] response status={response.status_code} body={response.text[:500]}")
                 response.raise_for_status()
                 response_payload = response.json()
                 content = response_payload["choices"][0]["message"]["content"]
                 return _extract_json_object(content)
             except (requests.RequestException, KeyError, ValueError) as error:
+                print(f"[TRANSLATOR DEBUG] exception: {type(error).__name__}: {error}")
                 last_error = error
                 if attempt == 4 or not _should_retry_completion(error):
                     raise
@@ -662,8 +704,12 @@ def load_protected_terms(path: str | Path) -> list[str]:
 
 
 def _strip_think_blocks(text: str) -> str:
-    """Remove <think>...</think> blocks that thinking models may emit."""
-    return re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    """Remove <think>...</think> blocks, stray tags, and plain-text thinking leakage."""
+    text = re.sub(r"<think[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"</?think\s*/?>", "", text, flags=re.IGNORECASE).strip()
+    # Strip plain-text thinking preambles like "Thinking Process:\n..." that some models emit
+    text = re.sub(r"(?i)^(thinking process|thought process|my thinking|思考过程|分析)[：:][^\n]*\n?", "", text).strip()
+    return text
 
 
 def _extract_json_object(text: str) -> dict:
@@ -958,11 +1004,28 @@ def _metadata_completion_prompt(
     placeholders: list[str],
     strict: bool,
 ) -> str:
+    if field_name == "description":
+        return (
+            "Write a Simplified Chinese description for a Chinese short-video platform based on the following video title. "
+            "Requirements: (1) describe only what the video is about, "
+            "(2) within 100 Chinese characters — hard limit, "
+            "(3) no URLs, no handles, no affiliate links, no promotional content, no calls to like/subscribe. "
+            "Return only the description text. No explanations. No quotes.\n\n"
+            f"Video title: {text}\n"
+            "Description:"
+        )
     field_label = f"YouTube {field_name}"
     if field_name == "tag":
         field_label = "YouTube tag"
+    title_instruction = ""
+    if field_name == "title":
+        title_instruction = (
+            "Summarize it into a concise version within 20 Chinese characters. "
+            "This is a hard limit — count carefully. "
+        )
     return (
         f"Translate the following {field_label} into accurate Simplified Chinese. "
+        f"{title_instruction}"
         "Do not add new facts or marketing phrases. Keep the meaning faithful to the source. "
         f"{_placeholder_instruction(placeholders, strict)} "
         "Return only the translation. No explanations. No quotes.\n\n"
@@ -1030,6 +1093,7 @@ def _clean_completion_translation(text: str) -> str:
     for marker in ("\n\n**Explanation:**", "\n**Explanation:**", "\n\nEnglish:", "\nEnglish:"):
         if marker in cleaned:
             cleaned = cleaned.split(marker, 1)[0].strip()
+    cleaned = _strip_think_blocks(cleaned)
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     if not lines:
         return ""
