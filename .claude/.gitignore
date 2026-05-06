@@ -1,0 +1,9 @@
+# spec 文件是你的工作记录，不分享
+specs/*
+!specs/.gitkeep
+
+# 项目里的个人私有偏好
+CLAUDE.local.md
+
+# 项目级 secret override
+settings.local.json

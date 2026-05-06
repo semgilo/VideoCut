@@ -46,5 +46,14 @@ def schedule_dubbing_timing(
                 f"(synthetic_duration={segment.synthetic_duration}, slot_duration={slot_duration})."
             )
 
-        # Use the exact required rate so synthesized audio lands on subtitle end.
-        segment.playback_rate = required_rate
+        # Clamp playback rate to ±10% to avoid excessive stretch/compress.
+        # Audio that falls outside the window is either slightly cut short or
+        # leaves a brief gap — both are less jarring than extreme speed changes.
+        clamped_rate = max(0.9, min(1.1, required_rate))
+        if clamped_rate != required_rate:
+            print(
+                f"  Segment {segment.index}: playback rate {required_rate:.4f} clamped to "
+                f"{clamped_rate:.4f} (slot={slot_duration:.3f}s, "
+                f"synth={segment.synthetic_duration:.3f}s)"
+            )
+        segment.playback_rate = clamped_rate

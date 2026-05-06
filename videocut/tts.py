@@ -32,12 +32,19 @@ def _synthesize_segments_with_cosyvoice(
     repo_dir = _resolve_cosyvoice_repo_dir(config)
     model_dir = _resolve_cosyvoice_model_dir(config, repo_dir)
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "cosyvoice_batch.py"
-    prompt_audio_path, prompt_text = _prepare_reference_material(
-        segments=segments,
-        output_dir=output_dir,
-        config=config,
-        source_video=source_video,
-    )
+    voice_clone_enabled = bool(config.enable_voice_clone)
+    cosyvoice_mode = config.cosyvoice_mode.strip().lower() or "cross_lingual"
+    prompt_audio_path: Path | None = None
+    prompt_text = ""
+    if voice_clone_enabled:
+        prompt_audio_path, prompt_text = _prepare_reference_material(
+            segments=segments,
+            output_dir=output_dir,
+            config=config,
+            source_video=source_video,
+        )
+    else:
+        cosyvoice_mode = "sft"
 
     pending_segments: list[Segment] = []
     reused = 0
@@ -73,16 +80,23 @@ def _synthesize_segments_with_cosyvoice(
         "--model-dir",
         str(model_dir),
         "--mode",
-        config.cosyvoice_mode,
-        "--prompt-audio",
-        str(prompt_audio_path),
+        cosyvoice_mode,
     ]
-    if prompt_text:
-        cmd.extend(["--prompt-text", prompt_text])
+    if voice_clone_enabled:
+        if prompt_audio_path is None:
+            raise RuntimeError("Voice cloning is enabled, but no prompt audio was prepared.")
+        cmd.extend(["--prompt-audio", str(prompt_audio_path)])
+        if prompt_text:
+            cmd.extend(["--prompt-text", prompt_text])
+    elif config.cosyvoice_speaker.strip():
+        cmd.extend(["--speaker", config.cosyvoice_speaker.strip()])
+
     worker_count = max(1, min(config.cosyvoice_concurrency, len(input_manifest)))
+    mode_desc = cosyvoice_mode if voice_clone_enabled else f"{cosyvoice_mode}, speaker={config.cosyvoice_speaker or 'auto'}"
     print(
         "Synthesizing Chinese dubbing with CosyVoice "
-        f"({config.cosyvoice_mode}, {len(pending_segments)} new / {len(segments)} total segments, "
+        f"({mode_desc}, voice_clone={'on' if voice_clone_enabled else 'off'}, "
+        f"{len(pending_segments)} new / {len(segments)} total segments, "
         f"group size {group_size}, workers {worker_count})..."
     )
     if worker_count == 1:

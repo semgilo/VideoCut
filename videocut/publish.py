@@ -86,6 +86,10 @@ def export_publish_assets(
     metadata_path = publish_dir / "metadata.json"
     preview_path = publish_dir / "content_preview.html"
 
+    # Safety net: ensure base title fits within 60 characters
+    if len(title) > 60:
+        title = title[:59].rstrip() + "…"
+    tags = _sort_tags_by_importance(tags)
     title_path.write_text(f"{title}\n", encoding="utf-8")
     tags_path.write_text(", ".join(tags), encoding="utf-8")
     description_path.write_text(description, encoding="utf-8")
@@ -127,6 +131,8 @@ def _copy_cover_image(cover_image_path: Path | None, publish_dir: Path) -> Path 
         return None
     suffix = cover_image_path.suffix.lower() or ".jpg"
     output_path = publish_dir / f"cover{suffix}"
+    if output_path.resolve() == cover_image_path.resolve():
+        return output_path
     shutil.copy2(cover_image_path, output_path)
     return output_path
 
@@ -299,6 +305,26 @@ def _build_preview_html(
 
 def _relative_path(path: Path, base_dir: Path) -> str:
     return os.path.relpath(path, start=base_dir)
+
+
+def _sort_tags_by_importance(tags: list[str]) -> list[str]:
+    """Sort tags: CJK first, then by length descending (more specific = more important)."""
+    def _is_cjk(text: str) -> bool:
+        return any("一" <= char <= "鿿" for char in text)
+
+    seen: set[str] = set()
+    deduped = []
+    for tag in tags:
+        lowered = tag.strip().lower()
+        if lowered and lowered not in seen:
+            deduped.append(tag.strip())
+            seen.add(lowered)
+
+    cjk_tags = [t for t in deduped if _is_cjk(t)]
+    other_tags = [t for t in deduped if not _is_cjk(t)]
+    cjk_tags.sort(key=lambda t: (-len(t), t))
+    other_tags.sort(key=lambda t: (-len(t), t))
+    return cjk_tags + other_tags
 
 
 def _clean_text(value: object) -> str:

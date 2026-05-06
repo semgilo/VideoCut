@@ -1,5 +1,4 @@
 [pipeline]
-export_platform_materials = true
 cleanup_source_after_publish = true  # use --no-cleanup-source to keep source/
 output_name = "final_cn.mp4"
 runs_dir = "runs"
@@ -20,6 +19,8 @@ python = "./.venv-cosyvoice/bin/python"
 repo_dir = ".vendor/CosyVoice"
 model_dir = ".vendor/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B"
 mode = "cross_lingual"  # or "zero_shot" (requires reference_text)
+voice_clone = true      # false => use built-in speaker mode (requires model spk2info.pt)
+speaker = ""            # optional speaker id when voice_clone=false; empty means auto-pick first
 group_size = 3
 concurrency = 2
 reference_audio_path = ""

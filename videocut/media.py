@@ -655,6 +655,9 @@ def compress_for_publish(
     - Short videos get higher bitrate (better quality)
     - Long videos are capped to fit within target_size_mb
 
+    A 5% headroom margin is applied internally since VBR tends to overshoot
+    the target on complex content.
+
     Returns the output path (same as output_path parameter).
     """
     if output_path.exists():
@@ -664,8 +667,10 @@ def compress_for_publish(
     if duration <= 0:
         raise RuntimeError(f"Cannot determine duration of {input_path}")
 
+    # Apply 5% headroom — VBR two-pass tends to overshoot on complex content
+    headroom_mb = target_size_mb * 0.95
     audio_bitrate_k = 128
-    total_bitrate_k = int((target_size_mb * 8192) / duration)
+    total_bitrate_k = int((headroom_mb * 8192) / duration)
     video_bitrate_k = max(total_bitrate_k - audio_bitrate_k, 100)
 
     # Scale filter only if needed
@@ -673,7 +678,8 @@ def compress_for_publish(
     if in_w > max_width or in_h > max_height:
         scale = (
             f"scale='min({max_width},iw)':'min({max_height},ih)':"
-            f"force_original_aspect_ratio=decrease"
+            f"force_original_aspect_ratio=decrease,"
+            f"scale='trunc(iw/2)*2:trunc(ih/2)*2'"
         )
     else:
         scale = "null"

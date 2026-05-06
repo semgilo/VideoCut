@@ -17,7 +17,10 @@ def main() -> None:
 
     jobs = json.loads(Path(args.input_json).read_text(encoding="utf-8"))
     cosyvoice = AutoModel(model_dir=str(Path(args.model_dir).expanduser().resolve()))
+    selected_speaker = _resolve_speaker(cosyvoice, args.speaker) if args.mode == "sft" else ""
     total = len(jobs)
+    if selected_speaker:
+        print(f"CosyVoice speaker: {selected_speaker}")
 
     with torch.inference_mode():
         for index, job in enumerate(jobs, start=1):
@@ -30,6 +33,7 @@ def main() -> None:
                 text=text,
                 prompt_audio=args.prompt_audio,
                 prompt_text=args.prompt_text,
+                speaker=selected_speaker,
             )
             speech = result["tts_speech"]
             if not isinstance(speech, torch.Tensor):
@@ -51,11 +55,15 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch CosyVoice synthesis helper for VideoCut.")
     parser.add_argument("--repo-dir", required=True)
     parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--mode", choices=("cross_lingual", "zero_shot"), required=True)
-    parser.add_argument("--prompt-audio", required=True)
+    parser.add_argument("--mode", choices=("cross_lingual", "zero_shot", "sft"), required=True)
+    parser.add_argument("--prompt-audio", default="")
     parser.add_argument("--prompt-text", default="")
+    parser.add_argument("--speaker", default="")
     parser.add_argument("--input-json", required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.mode in {"cross_lingual", "zero_shot"} and not str(args.prompt_audio).strip():
+        parser.error("--prompt-audio is required when mode is cross_lingual or zero_shot")
+    return args
 
 
 def _extend_python_path(repo_dir: Path) -> None:
@@ -74,6 +82,7 @@ def _run_inference(
     text: str,
     prompt_audio: str,
     prompt_text: str,
+    speaker: str,
 ) -> dict:
     model_name = cosyvoice.__class__.__name__
     prepared_text = _prepare_tts_text(model_name=model_name, text=text)
@@ -81,7 +90,13 @@ def _run_inference(
         model_name=model_name,
         prompt_text=prompt_text,
     )
-    if mode == "cross_lingual":
+    if mode == "sft":
+        result = cosyvoice.inference_sft(
+            tts_text=prepared_text,
+            spk_id=speaker,
+            stream=False,
+        )
+    elif mode == "cross_lingual":
         result = cosyvoice.inference_cross_lingual(
             tts_text=prepared_text,
             prompt_wav=prompt_audio,
@@ -102,6 +117,36 @@ def _run_inference(
     for item in result:
         return item
     raise RuntimeError("CosyVoice returned no audio output")
+
+
+def _resolve_speaker(cosyvoice: object, requested: str) -> str:
+    speaker = requested.strip()
+    if not hasattr(cosyvoice, "list_available_spks"):
+        if speaker:
+            return speaker
+        raise RuntimeError("Current CosyVoice model does not expose built-in speaker ids.")
+
+    available = list(getattr(cosyvoice, "list_available_spks")() or [])
+    if speaker:
+        if available and speaker in available:
+            return speaker
+        if available:
+            preview = ", ".join(available[:10])
+            raise RuntimeError(
+                f"Requested speaker '{speaker}' was not found. "
+                f"Available speakers (first 10): {preview}"
+            )
+        raise RuntimeError(
+            "This CosyVoice model has no built-in speakers. "
+            "Use voice cloning mode or switch to a model with `spk2info.pt`."
+        )
+
+    if not available:
+        raise RuntimeError(
+            "Voice cloning is disabled but no built-in speakers were found in the model. "
+            "Use --voice-clone or provide a model with built-in speakers (`spk2info.pt`)."
+        )
+    return str(available[0])
 
 
 def _prepare_tts_text(model_name: str, text: str) -> str:

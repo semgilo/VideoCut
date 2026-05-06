@@ -130,6 +130,11 @@ def main() -> None:
         timeout=config.llm_timeout,
         batch_size=TRANSLATION_BATCH_SIZE,
         concurrency=config.translation_concurrency,
+        target_cps=config.translation_target_cps,
+        min_playback_rate=config.min_playback_rate,
+        max_playback_rate=config.max_playback_rate,
+        enforce_char_budget=config.translation_enforce_char_budget,
+        budget_refine_passes=config.translation_budget_refine_passes,
         protected_terms=protected_terms,
     )
     print(
