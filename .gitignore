@@ -6,6 +6,7 @@ __pycache__/
 *.pyd
 .DS_Store
 .env
+videocut.toml
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

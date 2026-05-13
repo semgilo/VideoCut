@@ -101,6 +101,9 @@ def _check_llm_connectivity(config: PipelineConfig) -> tuple[bool, str]:
 
         models_url = base_url.rstrip("/") + "/models"
         req = urllib.request.Request(models_url, method="GET")
+        api_key = config.llm_api_key.strip()
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
         with urllib.request.urlopen(req, timeout=5) as resp:
             return _check("LLM connectivity", True, f"reachable at {base_url}")
     except urllib.error.HTTPError as e:
@@ -167,9 +170,17 @@ def run_doctor(config_path: str | None) -> int:
     else:
         results.append(_check(".env file", True, "not found (optional)"))
 
-    # Environment variables
-    results.append(_check_env_var("VIDEOCUT_LLM_BASE_URL", "LLM translation endpoint"))
-    results.append(_check_env_var("VIDEOCUT_LLM_API_KEY", "LLM API key"))
+    # LLM config (from env vars, .toml, or defaults)
+    llm_base_url = config.llm_base_url
+    llm_api_key = config.llm_api_key.strip()
+    if llm_base_url:
+        results.append(_check("LLM base URL", True, llm_base_url))
+    else:
+        results.append(_check("LLM base URL", False, "not configured"))
+    if llm_api_key:
+        results.append(_check("LLM API key", True, "configured"))
+    else:
+        results.append(_check("LLM API key", False, "not configured"))
     # VIDEOCUT_MODE defaults to "subtitle_only", so not set is fine
     mode_val = os.getenv("VIDEOCUT_MODE", "")
     if mode_val:

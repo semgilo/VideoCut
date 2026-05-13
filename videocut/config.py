@@ -29,9 +29,9 @@ class PipelineConfig:
     translation_backend: str = os.getenv("VIDEOCUT_TRANSLATION_BACKEND", "llm")  # "llm" or "google"
     cleanup_source_after_publish: bool = os.getenv("VIDEOCUT_CLEANUP_SOURCE_AFTER_PUBLISH", "1") != "0"
 
-    llm_base_url: str = os.getenv("VIDEOCUT_LLM_BASE_URL", "http://localhost:1234/v1")
+    llm_base_url: str = os.getenv("VIDEOCUT_LLM_BASE_URL", "https://api.minimaxi.com/v1")
     llm_api_key: str = os.getenv("VIDEOCUT_LLM_API_KEY", "")
-    llm_model: str = os.getenv("VIDEOCUT_LLM_MODEL", "translategemma-4b-it-mlx-4bit")
+    llm_model: str = os.getenv("VIDEOCUT_LLM_MODEL", "MiniMax-M2.7")
     llm_timeout: int = int(os.getenv("VIDEOCUT_LLM_TIMEOUT", "120"))
     translation_batch_size: int = int(os.getenv("VIDEOCUT_TRANSLATION_BATCH_SIZE", "10"))
     translation_concurrency: int = int(os.getenv("VIDEOCUT_TRANSLATION_CONCURRENCY", "1"))
@@ -75,6 +75,7 @@ class PipelineConfig:
     runs_dir: Path = Path("runs")
     compress_to_max_mb: int = int(os.getenv("VIDEOCUT_COMPRESS_TO_MAX_MB", "500"))
     output_name: str = "final_video.mp4"
+    mentions: str = ""  # comma-separated @mention targets for social publishing
 
 
 DEFAULT_CONFIG_PATH = Path("videocut.toml")
